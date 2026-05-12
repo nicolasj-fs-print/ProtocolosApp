@@ -1,0 +1,15 @@
+customtkinter>=5.2.2
+tkcalendar>=1.6.1
+pyodbc>=5.1.0
+sqlalchemy>=2.0
+pandas>=2.2
+openpyxl>=3.1
+python-dotenv>=1.0
+reportlab>=4.2
+PyMuPDF>=1.24
+Pillow>=10.0
+pywin32>=306
+pyinstaller>=6.6
+msal>=1.28
+msal-extensions>=1.1
+requests>=2.32

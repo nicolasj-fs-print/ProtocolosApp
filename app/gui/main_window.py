@@ -1,0 +1,764 @@
+"""Ventana principal de la app."""
+from __future__ import annotations
+
+import os
+import queue
+import threading
+import tkinter as tk
+from datetime import date, datetime, timedelta
+from pathlib import Path
+from tkinter import filedialog, messagebox
+
+import customtkinter as ctk
+import pandas as pd
+from PIL import Image
+from tkcalendar import DateEntry
+
+from ..config import Settings, get_settings
+from ..services import data_service
+from ..utils.logger import get_logger
+from ..utils.paths import resource_path
+from ..utils.validators import ensure_readable, ensure_writable
+from ..services import mail_service
+from ..services.pdf_service import ComprobanteResult
+from ..workers.generation_worker import GenerationWorker, ProgressEvent
+from .dialogs import AlreadyGeneratedDialog, MissingProtocolsDialog
+from .widgets import DataTable, MultiSelectListbox
+
+log = get_logger(__name__)
+
+APP_TITLE = "Generador de Protocolos de Calidad"
+APP_VERSION = "1.0.0"
+
+
+SUMMARY_COLS = ["Cliente", "Comprobante", "Fecha", "M2", "Observaciones"]
+SUMMARY_WIDTHS = [110, 160, 110, 90, 400]
+
+DETAIL_COLS = [
+    "Cliente", "Protocolo Serie LF", "Protocolo",
+    "Ancho", "Largo", "M2", "Serie",
+    "Comprobante", "Descripción"
+]
+DETAIL_WIDTHS = [120, 200, 160, 60, 60, 60, 150, 120, 280]
+
+
+def _fix_date_entry_focus_bug(de: DateEntry) -> None:
+    """Monkey-patch del `_on_focus_out_cal` de tkcalendar.DateEntry.
+
+    Bug original (ver tkcalendar/dateentry.py línea 248): cuando hacés click
+    en las flechas de cambio de mes ◀ ▶, el Calendar interno pierde el focus
+    y `focus_get()` puede devolver None. El método original entra al else
+    final y hace `withdraw()` → popup cerrado.
+
+    Este patch chequea SIEMPRE primero si el mouse está sobre el popup. Si
+    está, re-focusea el calendar y NO cierra. Si está afuera, cierra normal.
+    """
+    import types
+
+    def _patched(self, _event):
+        try:
+            x, y = self._top_cal.winfo_pointerxy()
+            xc = self._top_cal.winfo_rootx()
+            yc = self._top_cal.winfo_rooty()
+            w = self._top_cal.winfo_width()
+            h = self._top_cal.winfo_height()
+            if xc <= x <= xc + w and yc <= y <= yc + h:
+                # Mouse adentro del popup → mantener abierto.
+                self._calendar.focus_force()
+                return
+        except Exception:
+            pass
+        # Mouse afuera → cerrar (comportamiento default).
+        try:
+            self._top_cal.withdraw()
+            self.state(['!pressed'])
+        except Exception:
+            pass
+
+    try:
+        de._on_focus_out_cal = types.MethodType(_patched, de)
+        # Re-bindear el evento para usar el método patcheado.
+        de._calendar.unbind('<FocusOut>')
+        de._calendar.bind('<FocusOut>', de._on_focus_out_cal)
+    except Exception as e:
+        log.debug("_fix_date_entry_focus_bug: %s", e)
+
+
+class MainWindow(ctk.CTk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"{APP_TITLE} v{APP_VERSION}")
+        self.geometry("1480x880")
+        self.minsize(1240, 720)
+        # Icono de la ventana (title bar + taskbar de Windows).
+        try:
+            ico = resource_path("assets/Icono.ico")
+            if ico.exists():
+                self.iconbitmap(default=str(ico))
+        except Exception as e:
+            log.warning("No se pudo aplicar Icono.ico: %s", e)
+
+        ctk.set_appearance_mode("System")
+        ctk.set_default_color_theme("blue")
+
+        self.settings: Settings = get_settings()
+
+        self.df: pd.DataFrame | None = None
+        self.events: "queue.Queue[ProgressEvent]" = queue.Queue()
+        self.cancel_event = threading.Event()
+        self.worker: GenerationWorker | None = None
+
+        self._logo_fs_img: ctk.CTkImage | None = None
+        self._logo_fed_img: ctk.CTkImage | None = None
+
+        self._build_layout()
+        self._refresh_logos()
+        if self.settings.storage_backend == "sharepoint":
+            self._authenticate_sharepoint()
+        else:
+            self._validate_paths_on_start()
+        self.after(120, self._poll_events)
+
+    # ----------------------- Auth SharePoint -----------------------
+
+    def _authenticate_sharepoint(self) -> None:
+        from ..sharepoint.auth import AuthError, ensure_authenticated
+        from ..sharepoint.client import SharePointError, get_client
+        try:
+            self.update_idletasks()
+            self._log_console("Autenticando contra Microsoft 365...")
+            ensure_authenticated()
+            client = get_client()
+            client.site_id()
+            client.drive_id()
+            self._log_console("Sesión SharePoint OK.")
+            # NOTA: NO llamamos register_login() ni warm_up_excels() acá.
+            # Esos hacían I/O contra Graph en paralelo con el primer Buscar y
+            # estaban colgando la descarga de Stock Mendoza. Ahora la telemetría
+            # corre al FINAL del worker (cuando ya no hay competencia).
+        except (AuthError, SharePointError) as e:
+            log.exception("Auth/SP falló")
+            messagebox.showerror(
+                "Sin conexión a SharePoint",
+                f"No se pudo autenticar / conectar:\n\n{e}\n\nLa app va a quedar deshabilitada hasta reintentar.",
+            )
+            self.btn_buscar.configure(state="disabled")
+            self.btn_generar.configure(state="disabled")
+            self.btn_borrar.configure(state="disabled")
+        except Exception as e:
+            log.exception("Error inesperado en auth")
+            messagebox.showerror("Error inesperado", str(e))
+
+    # ----------------------- Layout -----------------------
+
+    def _build_layout(self) -> None:
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)
+
+        # Top bar
+        top = ctk.CTkFrame(self, corner_radius=0, height=70)
+        top.grid(row=0, column=0, sticky="ew")
+        top.grid_columnconfigure(1, weight=1)
+
+        self.lbl_logo_fs = ctk.CTkLabel(top, text="")
+        self.lbl_logo_fs.grid(row=0, column=0, padx=(16, 8), pady=10, sticky="w")
+        self.lbl_logo_fed = ctk.CTkLabel(top, text="")
+        self.lbl_logo_fed.grid(row=0, column=2, padx=(8, 16), pady=10, sticky="e")
+
+        ctk.CTkLabel(top, text=APP_TITLE,
+                     font=ctk.CTkFont(size=18, weight="bold")
+                     ).grid(row=0, column=1, padx=8, pady=10)
+
+        self.theme_switch = ctk.CTkSegmentedButton(
+            top, values=["Light", "Dark", "System"],
+            command=self._on_theme_change,
+        )
+        self.theme_switch.set("System")
+        self.theme_switch.grid(row=0, column=3, padx=12, pady=10, sticky="e")
+
+        # Filtros
+        filters = ctk.CTkFrame(self)
+        filters.grid(row=1, column=0, sticky="ew", padx=12, pady=(12, 6))
+        for i in range(9):
+            filters.grid_columnconfigure(i, weight=0)
+        filters.grid_columnconfigure(7, weight=1)  # spacer expansible
+
+        date_font = ("Segoe UI", 16, "bold")
+        lbl_font = ctk.CTkFont(size=15, weight="bold")
+
+        ctk.CTkLabel(filters, text="Desde:", font=lbl_font).grid(
+            row=0, column=0, padx=(12, 6), pady=12, sticky="e"
+        )
+        self.date_from = DateEntry(
+            filters, date_pattern="dd-mm-yyyy", width=14,
+            font=date_font, justify="center",
+        )
+        self.date_from.set_date(date.today() - timedelta(days=7))
+        self.date_from.grid(row=0, column=1, padx=6, pady=12, ipady=4)
+        _fix_date_entry_focus_bug(self.date_from)
+
+        ctk.CTkLabel(filters, text="Hasta:", font=lbl_font).grid(
+            row=0, column=2, padx=(16, 6), pady=12, sticky="e"
+        )
+        self.date_to = DateEntry(
+            filters, date_pattern="dd-mm-yyyy", width=14,
+            font=date_font, justify="center",
+        )
+        self.date_to.set_date(date.today())
+        self.date_to.grid(row=0, column=3, padx=6, pady=12, ipady=4)
+        _fix_date_entry_focus_bug(self.date_to)
+
+        self.btn_buscar = ctk.CTkButton(filters, text="Buscar", width=110, command=self._on_buscar)
+        self.btn_buscar.grid(row=0, column=4, padx=(16, 4), pady=10)
+
+        self.btn_borrar = ctk.CTkButton(
+            filters, text="Borrar filtros", width=130,
+            command=self._on_borrar,
+            fg_color="#555555", hover_color="#3d3d3d",
+        )
+        self.btn_borrar.grid(row=0, column=5, padx=4, pady=10)
+
+        self.btn_open_folder = ctk.CTkButton(
+            filters, text="Abrir carpeta", width=120,
+            command=self._on_open_output,
+        )
+        self.btn_open_folder.grid(row=0, column=6, padx=4, pady=10)
+
+        # col 7 = spacer expansible (weight=1) → empuja "Generar" al borde derecho
+
+        self.btn_generar = ctk.CTkButton(
+            filters, text="Generar protocolos", width=170,
+            state="disabled", command=self._on_generar,
+        )
+        self.btn_generar.grid(row=0, column=8, padx=(20, 10), pady=10, sticky="e")
+
+        # Entry de carpeta de salida — siempre creado por compatibilidad,
+        # pero solo se muestra en backend "local". En "sharepoint" la ruta
+        # se informa en el mensaje final de "Generación finalizada".
+        is_sp = self.settings.storage_backend == "sharepoint"
+        self.entry_output = ctk.CTkEntry(filters)
+        if is_sp:
+            self.entry_output.insert(0, self.settings.sp_output_folder)
+            self.entry_output.configure(state="readonly")
+        else:
+            self.entry_output.insert(0, str(self.settings.default_output_folder))
+        self.btn_browse = ctk.CTkButton(filters, text="...", width=36, command=self._on_browse_output)
+
+        if not is_sp:
+            ctk.CTkLabel(filters, text="Carpeta de salida:").grid(
+                row=1, column=0, padx=(10, 4), pady=(0, 10), sticky="e"
+            )
+            self.entry_output.grid(row=1, column=1, columnspan=4, padx=4, pady=(0, 10), sticky="ew")
+            self.btn_browse.grid(row=1, column=5, padx=4, pady=(0, 10), sticky="w")
+
+        # Body: paneles principales
+        body = ctk.CTkFrame(self)
+        body.grid(row=2, column=0, sticky="nsew", padx=12, pady=6)
+        body.grid_columnconfigure(0, weight=0)  # clientes list
+        body.grid_columnconfigure(1, weight=0)  # comprobantes list
+        body.grid_columnconfigure(2, weight=1)  # tablas
+        body.grid_rowconfigure(0, weight=1)
+
+        # Lista clientes
+        self.list_clientes = MultiSelectListbox(
+            body, title="Clientes",
+            on_select=self._on_clientes_changed,
+            height=12, width=200,
+        )
+        self.list_clientes.grid(row=0, column=0, sticky="nsew", padx=(8, 4), pady=8)
+
+        # Lista comprobantes
+        self.list_comprobantes = MultiSelectListbox(
+            body, title="Comprobantes",
+            on_select=self._on_comprobantes_changed,
+            height=12, width=240,
+        )
+        self.list_comprobantes.grid(row=0, column=1, sticky="nsew", padx=4, pady=8)
+
+        # Panel tablas (resumen + detalle apilados)
+        right = ctk.CTkFrame(body)
+        right.grid(row=0, column=2, sticky="nsew", padx=(4, 8), pady=8)
+        right.grid_columnconfigure(0, weight=1)
+        right.grid_rowconfigure(1, weight=1)
+        right.grid_rowconfigure(3, weight=2)
+
+        ctk.CTkLabel(right, text="Resumen por comprobante",
+                     anchor="w", font=ctk.CTkFont(weight="bold")
+                     ).grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 2))
+        self.tbl_summary = DataTable(right, columns=SUMMARY_COLS, widths=SUMMARY_WIDTHS, height=6)
+        self.tbl_summary.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 6))
+
+        ctk.CTkLabel(right, text="Detalle (TIPPRO = SAFED)",
+                     anchor="w", font=ctk.CTkFont(weight="bold")
+                     ).grid(row=2, column=0, sticky="ew", padx=8, pady=(2, 2))
+        self.tbl_detail = DataTable(right, columns=DETAIL_COLS, widths=DETAIL_WIDTHS, height=10)
+        self.tbl_detail.grid(row=3, column=0, sticky="nsew", padx=8, pady=(0, 8))
+
+        # Bottom: status + progreso (sin consola de logs, todo va al archivo .log)
+        bottom = ctk.CTkFrame(self)
+        bottom.grid(row=3, column=0, sticky="ew", padx=12, pady=(6, 12))
+        bottom.grid_columnconfigure(1, weight=1)
+
+        self.lbl_summary_text = ctk.CTkLabel(
+            bottom, text="Sin datos.", anchor="w",
+            font=ctk.CTkFont(size=14, weight="bold"),
+        )
+        self.lbl_summary_text.grid(row=0, column=0, sticky="w", padx=12, pady=(10, 0))
+
+        self.lbl_status = ctk.CTkLabel(
+            bottom, text="Listo.", anchor="w",
+            font=ctk.CTkFont(size=13),
+        )
+        self.lbl_status.grid(row=1, column=0, sticky="w", padx=12, pady=(0, 10))
+
+        self.progress = ctk.CTkProgressBar(bottom)
+        self.progress.grid(row=0, column=1, sticky="ew", padx=12, pady=(14, 4), rowspan=1)
+        self.progress.set(0)
+
+        actions = ctk.CTkFrame(bottom, fg_color="transparent")
+        actions.grid(row=0, column=2, rowspan=2, sticky="e", padx=8, pady=8)
+
+        self.btn_cancelar = ctk.CTkButton(
+            actions, text="Cancelar", state="disabled",
+            command=self._on_cancelar,
+            fg_color="#9c2a2a", hover_color="#7a2020", width=110,
+        )
+        self.btn_cancelar.grid(row=0, column=0, padx=4, pady=2)
+
+        self.btn_open_logs = ctk.CTkButton(
+            actions, text="Abrir logs", width=110,
+            command=self._on_open_logs,
+        )
+        self.btn_open_logs.grid(row=0, column=1, padx=4, pady=2)
+
+    # ----------------------- Logos / Tema -----------------------
+
+    def _refresh_logos(self) -> None:
+        try:
+            fs_light = Image.open(resource_path("assets/logo_fs.png"))
+            fs_dark = Image.open(resource_path("assets/logo_fs_dark.png"))
+            fed_light = Image.open(resource_path("assets/logo_fedrigoni.png"))
+            fed_dark = Image.open(resource_path("assets/logo_fedrigoni_dark.png"))
+        except FileNotFoundError as e:
+            log.warning("Logo faltante: %s", e)
+            return
+
+        h = 42
+        fs_size = self._fit(fs_light, h)
+        fed_size = self._fit(fed_light, h)
+
+        fs_light_r = fs_light.resize(fs_size, Image.LANCZOS)
+        fs_dark_r = fs_dark.resize(fs_size, Image.LANCZOS)
+        fed_light_r = fed_light.resize(fed_size, Image.LANCZOS)
+        fed_dark_r = fed_dark.resize(fed_size, Image.LANCZOS)
+
+        self._logo_fs_img = ctk.CTkImage(
+            light_image=fs_light_r, dark_image=fs_dark_r, size=fs_size,
+        )
+        self._logo_fed_img = ctk.CTkImage(
+            light_image=fed_light_r, dark_image=fed_dark_r, size=fed_size,
+        )
+        self.lbl_logo_fs.configure(image=self._logo_fs_img, text="")
+        self.lbl_logo_fed.configure(image=self._logo_fed_img, text="")
+
+    @staticmethod
+    def _fit(img: Image.Image, target_h: int) -> tuple[int, int]:
+        ratio = img.width / max(img.height, 1)
+        return (max(1, int(target_h * ratio)), target_h)
+
+    def _on_theme_change(self, value: str) -> None:
+        ctk.set_appearance_mode(value)
+        self._refresh_logos()
+
+    # ----------------------- Validaciones iniciales -----------------------
+
+    def _validate_paths_on_start(self) -> None:
+        s = self.settings
+        try:
+            ensure_readable(s.protocols_folder, "Carpeta de protocolos")
+            self._log_console(f"OK Carpeta protocolos: {s.protocols_folder}")
+        except Exception as e:
+            messagebox.showwarning("Acceso a SharePoint", str(e))
+            self._log_console(f"⚠ {e}")
+
+        try:
+            ensure_writable(s.default_output_folder, "Carpeta de salida (Reportes Finales)")
+            self._log_console(f"OK Carpeta salida: {s.default_output_folder}")
+        except Exception as e:
+            messagebox.showwarning("Acceso a SharePoint", str(e))
+            self._log_console(f"⚠ {e}")
+
+    # ----------------------- Acciones top -----------------------
+
+    def _on_browse_output(self) -> None:
+        initial = self.entry_output.get() or str(Path.home())
+        folder = filedialog.askdirectory(initialdir=initial, title="Seleccionar carpeta de salida")
+        if folder:
+            self.entry_output.delete(0, "end")
+            self.entry_output.insert(0, folder)
+
+    def _on_buscar(self) -> None:
+        """Lanza fetch_data en un thread daemon — la GUI sigue responsiva."""
+        try:
+            d_from = self.date_from.get_date()
+            d_to = self.date_to.get_date()
+        except Exception as e:
+            messagebox.showerror("Fechas inválidas", str(e))
+            return
+
+        self._log_console(f"Consultando datos {d_from} → {d_to}...")
+        self.lbl_status.configure(text="Buscando datos...")
+        self.btn_buscar.configure(state="disabled")
+        self.btn_generar.configure(state="disabled")
+        self.btn_borrar.configure(state="disabled")
+        self.update_idletasks()
+
+        threading.Thread(
+            target=self._buscar_worker,
+            args=(d_from, d_to),
+            daemon=True,
+        ).start()
+
+    def _buscar_worker(self, d_from, d_to) -> None:
+        try:
+            df = data_service.fetch_data(d_from, d_to)
+            self.events.put(ProgressEvent("fetch_done", payload=df))
+        except Exception as e:
+            log.exception("Error en buscar worker")
+            self.events.put(ProgressEvent("fetch_error", message=str(e)))
+
+    def _on_borrar(self) -> None:
+        self.df = None
+        self.list_clientes.set_items([])
+        self.list_comprobantes.set_items([])
+        self.tbl_summary.clear()
+        self.tbl_detail.clear()
+        self.lbl_summary_text.configure(text="Sin datos.")
+        self.btn_generar.configure(state="disabled")
+        self.progress.set(0)
+        self._log_console("Filtros y datos limpiados.")
+
+    def _on_generar(self) -> None:
+        log.info("_on_generar invocado")
+        if self.df is None or self.df.empty:
+            log.info("→ self.df vacío, messagebox y return")
+            messagebox.showinfo("Sin datos", "Primero buscá datos con un rango válido.")
+            return
+
+        df_filtered = self._current_filtered_df()
+        log.info("→ df_filtered: %d filas", len(df_filtered))
+        if df_filtered.empty:
+            messagebox.showinfo("Sin datos", "El filtro actual no devuelve filas.")
+            return
+
+        # Si el worker anterior sigue vivo, no permitimos arrancar otro.
+        if self.worker is not None and self.worker.is_alive():
+            log.info("→ worker anterior sigue vivo, abort")
+            messagebox.showinfo(
+                "Procesando",
+                "Hay una generación en curso. Esperá a que termine o cancelala primero.",
+            )
+            return
+
+        if self.settings.storage_backend == "sharepoint":
+            out_dir = self.settings.sp_output_folder
+            if not out_dir:
+                messagebox.showerror("Configuración", "SP_OUTPUT_FOLDER vacío en .env.")
+                return
+        else:
+            out_dir = Path(self.entry_output.get().strip())
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                ensure_writable(out_dir, "Carpeta de salida")
+            except Exception as e:
+                messagebox.showerror("Carpeta inválida", str(e))
+                return
+
+        # Pre-análisis: comprobantes con items SAFED sin protocolo
+        missing = data_service.analyze_missing_protocols(df_filtered)
+        log.info("→ missing: %d comprobante(s) con items sin protocolo", len(missing))
+        pre_results: list[ComprobanteResult] = []
+
+        if missing:
+            try:
+                detail_full = data_service.build_detail_view(df_filtered).copy()
+                problematicos = list(missing.keys())
+                export_df = detail_full[detail_full["Comprobante"].astype(str).isin(problematicos)].copy()
+                if not export_df.empty:
+                    mask_missing = export_df["Protocolo"].fillna("").astype(str).str.strip() == ""
+                    # Solo las filas que realmente NO tienen protocolo.
+                    export_df = export_df[mask_missing].copy()
+                    export_df["Protocolo"] = "⚠ FALTA PROTOCOLO"
+                    export_df = export_df.reindex(columns=DETAIL_COLS, fill_value="")
+            except Exception as e:
+                log.exception("No se pudo armar export_df")
+                export_df = None
+
+            log.info("Abriendo MissingProtocolsDialog (modal)")
+            dialog = MissingProtocolsDialog(self, missing, export_df=export_df)
+            decision = dialog.show()
+            log.info("MissingProtocolsDialog cerrado con: %s", decision)
+            if decision == "cancel":
+                self._log_console("Generación cancelada por el usuario.")
+                return
+            if decision == "skip":
+                problematicos = list(missing.keys())
+                df_filtered = df_filtered[~df_filtered["#Comprobante"].astype(str).isin(problematicos)]
+                for comp, info in missing.items():
+                    pre_results.append(ComprobanteResult(
+                        comprobante=comp,
+                        cliente=info["cliente"],
+                        razon_social=info["razon_social"],
+                        numero_oc=info["oc"],
+                        mail=info["mail"],
+                        estado="omitido_por_usuario",
+                    ))
+                self._log_console(f"Omitidos por el usuario: {len(problematicos)} comprobante(s).")
+
+        log.info("→ Lanzando GenerationWorker (df=%d filas, pre_results=%d)",
+                 len(df_filtered), len(pre_results))
+        self.cancel_event.clear()
+        self.btn_generar.configure(state="disabled")
+        self.btn_buscar.configure(state="disabled")
+        self.btn_borrar.configure(state="disabled")
+        self.btn_cancelar.configure(state="normal")
+        self.progress.set(0)
+        self.lbl_status.configure(text="Generando...")
+
+        self.worker = GenerationWorker(
+            df=df_filtered,
+            output_dir=out_dir,
+            protocols_folder=self.settings.protocols_folder,
+            events=self.events,
+            cancel_event=self.cancel_event,
+            pre_results=pre_results,
+        )
+        self.worker.start()
+        log.info("→ Worker lanzado, alive=%s", self.worker.is_alive())
+
+    def _on_cancelar(self) -> None:
+        if self.worker and self.worker.is_alive():
+            self.cancel_event.set()
+            self._log_console("Cancelación solicitada... esperando a que termine el comprobante actual.")
+
+    def _on_open_output(self) -> None:
+        if self.settings.storage_backend == "sharepoint":
+            try:
+                import webbrowser
+                from ..sharepoint.client import get_client
+                url = get_client().folder_web_url(self.settings.sp_output_folder)
+                webbrowser.open(url)
+            except Exception as e:
+                messagebox.showerror("Error", f"No se pudo abrir la carpeta SharePoint:\n{e}")
+            return
+        path = self.entry_output.get().strip()
+        if path and Path(path).exists():
+            os.startfile(path)
+        else:
+            messagebox.showinfo("Carpeta", "La carpeta no existe todavía.")
+
+    def _on_open_logs(self) -> None:
+        from ..utils.paths import runtime_dir
+        logs_dir = runtime_dir() / "logs"
+        if logs_dir.exists():
+            os.startfile(logs_dir)
+        else:
+            messagebox.showinfo("Logs", f"Aún no hay logs ({logs_dir}).")
+
+    # ----------------------- Cross-filter -----------------------
+
+    def _on_clientes_changed(self, selected: list[str]) -> None:
+        if self.df is None:
+            return
+        if selected:
+            allowed = self.df[self.df["Código de Cliente"].astype(str).isin(selected)]
+            self.list_comprobantes.set_items_filtered(data_service.distinct_comprobantes(allowed))
+        else:
+            self.list_comprobantes.set_items_filtered(data_service.distinct_comprobantes(self.df))
+        self._refresh_tables()
+
+    def _on_comprobantes_changed(self, selected: list[str]) -> None:
+        if self.df is None:
+            return
+        if selected:
+            allowed = self.df[self.df["#Comprobante"].astype(str).isin(selected)]
+            self.list_clientes.set_items_filtered(data_service.distinct_clientes(allowed))
+        else:
+            self.list_clientes.set_items_filtered(data_service.distinct_clientes(self.df))
+        self._refresh_tables()
+
+    def _current_filtered_df(self) -> pd.DataFrame:
+        if self.df is None:
+            return pd.DataFrame()
+        return data_service.apply_filters(
+            self.df,
+            clientes=self.list_clientes.get_selected() or None,
+            comprobantes=self.list_comprobantes.get_selected() or None,
+        )
+
+    def _refresh_tables(self) -> None:
+        df = self._current_filtered_df()
+        summary = data_service.build_summary_view(df)
+        detail = data_service.build_detail_view(df).copy()
+
+        # Marca visual: items SAFED sin Protocolo → "⚠ FALTA PROTOCOLO" + tag rojo bold
+        if not detail.empty:
+            mask_missing = detail["Protocolo"].fillna("").astype(str).str.strip() == ""
+            detail.loc[mask_missing, "Protocolo"] = "⚠ FALTA PROTOCOLO"
+
+        self.tbl_summary.set_rows(summary.to_dict(orient="records"))
+        self.tbl_detail.set_rows(
+            detail.to_dict(orient="records"),
+            flag_predicate=lambda r: r.get("Protocolo") == "⚠ FALTA PROTOCOLO",
+        )
+        n_comp = len(summary)
+        n_filas = len(df)
+        n_safed = len(detail)
+        self.lbl_summary_text.configure(
+            text=f"Comprobantes: {n_comp}  |  Filas: {n_filas}  |  Items SAFED: {n_safed}"
+        )
+
+    # ----------------------- Polling de eventos worker -----------------------
+
+    def _poll_events(self) -> None:
+        try:
+            while True:
+                ev = self.events.get_nowait()
+                self._handle_event(ev)
+        except queue.Empty:
+            pass
+        self.after(120, self._poll_events)
+
+    def _handle_event(self, ev: ProgressEvent) -> None:
+        if ev.kind == "log":
+            self._log_console(ev.message)
+        elif ev.kind == "progress":
+            if ev.total > 0:
+                self.progress.set(ev.current / ev.total)
+                self.lbl_status.configure(text=f"{ev.current}/{ev.total}")
+        elif ev.kind == "result":
+            if ev.message:
+                self._log_console(ev.message)
+        elif ev.kind == "fetch_done":
+            df = ev.payload
+            self.df = df
+            self.list_clientes.set_items(data_service.distinct_clientes(df))
+            self.list_comprobantes.set_items(data_service.distinct_comprobantes(df))
+            self._refresh_tables()
+            n_filas = len(df) if df is not None else 0
+            n_cli = len(self.list_clientes._all_items)
+            n_comp = len(self.list_comprobantes._all_items)
+            self._log_console(
+                f"Datos cargados: {n_filas} filas, {n_cli} cliente(s), {n_comp} comprobante(s)."
+            )
+            self.lbl_status.configure(text="Datos cargados.")
+            self.btn_buscar.configure(state="normal")
+            self.btn_borrar.configure(state="normal")
+            self.btn_generar.configure(state="normal" if n_filas > 0 else "disabled")
+        elif ev.kind == "fetch_error":
+            self._log_console(f"✗ Error: {ev.message}")
+            self.lbl_status.configure(text="Error.")
+            self.btn_buscar.configure(state="normal")
+            self.btn_borrar.configure(state="normal")
+            self.btn_generar.configure(state="disabled")
+            messagebox.showerror("Error al buscar datos", ev.message)
+        elif ev.kind == "done":
+            self._log_console(ev.message)
+            self.progress.set(1.0)
+            self.lbl_status.configure(text="Listo.")
+            self.btn_generar.configure(state="normal")
+            self.btn_buscar.configure(state="normal")
+            self.btn_borrar.configure(state="normal")
+            self.btn_cancelar.configure(state="disabled")
+            self._maybe_open_drafts(ev.payload or [])
+        elif ev.kind == "error":
+            self._log_console(ev.message)
+            self.lbl_status.configure(text="Error.")
+            self.btn_generar.configure(state="normal")
+            self.btn_buscar.configure(state="normal")
+            self.btn_borrar.configure(state="normal")
+            self.btn_cancelar.configure(state="disabled")
+            messagebox.showerror("Error", ev.message)
+
+    def _output_location_text(self) -> str:
+        """Texto amigable de la carpeta de salida para mostrar al usuario."""
+        if self.settings.storage_backend == "sharepoint":
+            site = self.settings.sharepoint_site or "VentasPowerBI"
+            sub = (self.settings.sp_output_folder or "").replace("\\", "/")
+            crumbs = " > ".join([p for p in sub.split("/") if p])
+            return f"{site} > Documentos compartidos > {crumbs}"
+        return str(self.settings.default_output_folder)
+
+    def _maybe_open_drafts(self, results: list[ComprobanteResult]) -> None:
+        log.info("_maybe_open_drafts: %d results", len(results))
+        # 1) Si hubo remitos que ya estaban generados, mostrar dialog informativo.
+        ya_existen = [r.comprobante for r in results if r.estado == "ya_existe"]
+        if ya_existen:
+            try:
+                AlreadyGeneratedDialog(
+                    self,
+                    comprobantes=ya_existen,
+                    open_folder_callback=self._on_open_output,
+                    location_text=self._output_location_text(),
+                ).show()
+            except Exception as e:
+                log.warning("No se pudo mostrar dialog ya_generados: %s", e)
+
+        # 2) Borradores Outlook para los que SÍ se generaron (ok / solo_caratula).
+        eligibles = [
+            r for r in results
+            if r.estado in ("ok", "solo_caratula") and r.mail and r.pdf_path
+        ]
+        n = len(eligibles)
+        n_generados = sum(1 for r in results if r.estado in ("ok", "solo_caratula"))
+        done_msg = (
+            f"Protocolos generados: {n_generados} comprobante(s).\n"
+            f"Guardado en: {self._output_location_text()}"
+        )
+
+        if n == 0:
+            messagebox.showinfo("Finalizado", done_msg + "\n\nNo hay borradores para abrir.")
+            return
+
+        ask = messagebox.askyesno(
+            "Borradores Outlook",
+            f"{done_msg}\n\n¿Querés abrir {n} borrador(es) en Outlook ahora?",
+        )
+        if not ask:
+            self._log_console("El usuario eligió no abrir borradores.")
+            return
+
+        self._log_console(f"Abriendo {n} borrador(es) en Outlook...")
+        ok = 0
+        for r in eligibles:
+            try:
+                # Outlook necesita un path LOCAL para adjuntar.
+                attach_path = Path(r.pdf_local_path) if r.pdf_local_path else Path(r.pdf_path)
+                mail_service.open_outlook_draft(
+                    to=r.mail,
+                    razon_social=r.razon_social,
+                    comprobante=r.comprobante,
+                    pdf_path=attach_path,
+                    protocolos_encontrados=r.protocolos_encontrados,
+                    protocolos_no_encontrados=r.protocolos_no_encontrados,
+                )
+                ok += 1
+            except Exception as e:
+                log.exception("Error abriendo borrador Outlook para %s", r.comprobante)
+                self._log_console(f"⚠ No se pudo abrir Outlook para {r.comprobante}: {e}")
+
+        skipped = [r for r in results if r.estado in ("ok", "solo_caratula") and not r.mail]
+        if skipped:
+            self._log_console(
+                f"{len(skipped)} comprobante(s) sin Mail Protocolos → no se abrió borrador."
+            )
+        self._log_console(f"Borradores abiertos: {ok}/{n}.")
+
+    def _log_console(self, text: str) -> None:
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {text}"
+        log.info(text)
+        try:
+            self.lbl_status.configure(text=line)
+        except Exception:
+            pass
