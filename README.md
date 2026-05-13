@@ -1,6 +1,6 @@
 # Generador de Protocolos de Calidad
 
-App de escritorio Python que reemplaza el flujo Power BI + Power Automate + Encodian para generar PDFs consolidados de protocolos de calidad por comprobante/remito a partir de SQL Server, leyendo y escribiendo archivos directo en SharePoint vía Microsoft Graph.
+App de escritorio Python que reemplaza un flujo legacy de Power BI + Power Automate + Encodian para generar PDFs consolidados de protocolos de calidad por comprobante/remito a partir de SQL Server, leyendo y escribiendo archivos directo en SharePoint vía Microsoft Graph.
 
 ---
 
@@ -8,10 +8,10 @@ App de escritorio Python que reemplaza el flujo Power BI + Power Automate + Enco
 
 - Windows 10/11.
 - Python 3.11+ (solo para desarrollo / build; los usuarios finales reciben el `.exe`).
-- Cuenta `@fs-print.com` con acceso al sitio SharePoint **VentasPowerBI** (Documentos compartidos / Protocolos Calidad / ...).
-- IP autorizada en el servidor SQL `vdc.fs-print.com,1433`.
+- Cuenta corporativa con acceso al sitio SharePoint donde viven los archivos.
+- IP autorizada en el servidor SQL (si la DB tiene whitelist por IP).
 - Outlook instalado (para los borradores de mail).
-- **ODBC Driver 18 for SQL Server**: la app lo instala sola al primer arranque desde el `.msi` embebido. No hace falta hacerlo manualmente.
+- **ODBC Driver 18 for SQL Server**: la app lo instala sola al primer arranque desde el `.msi` embebido (`tools/msodbcsql18.msi`). No hace falta hacerlo manualmente.
 
 ---
 
@@ -22,7 +22,7 @@ python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 copy .env.example .env
-# Editá .env si hace falta cambiar credenciales/paths.
+# Editá .env con credenciales y paths reales (ver tabla abajo).
 python -m app.main
 ```
 
@@ -41,25 +41,48 @@ Trae un dataset hardcoded en `data_service._mock_dataframe()` para validar la ge
 | Variable | Descripción |
 |---|---|
 | `SQL_DRIVER` | Default `ODBC Driver 18 for SQL Server`. |
-| `SQL_SERVER` | `vdc.fs-print.com,1433`. |
-| `SQL_DATABASE` | `FSPRINT` (principal). |
-| `SQL_DATABASE_TRAZABILIDAD` | `FSBI` (lookup TrazabilidadPapel). |
-| `SQL_TRUSTED_CONNECTION` | `false` (usamos SQL auth). |
-| `SQL_USER` / `SQL_PASSWORD` | Credenciales SQL. |
-| `SQL_TRUST_SERVER_CERT` | `yes`. |
-| `SQL_ENCRYPT` | `yes`. |
+| `SQL_SERVER` | Host del SQL Server. Formato `host\instancia` o `host,puerto`. |
+| `SQL_DATABASE` | Nombre de la base de datos principal. |
+| `SQL_DATABASE_TRAZABILIDAD` | DB secundaria para el lookup de trazabilidad. |
+| `SQL_TRUSTED_CONNECTION` | `false` para SQL auth, `true` para Windows auth. |
+| `SQL_USER` / `SQL_PASSWORD` | Credenciales SQL si `TRUSTED_CONNECTION=false`. |
+| `SQL_TRUST_SERVER_CERT` | `yes` (default, evita "self-signed certificate"). |
+| `SQL_ENCRYPT` | `yes` (default). |
 | `STORAGE_BACKEND` | `sharepoint` (recomendado) o `local`. |
-| `MS_TENANT_ID` | GUID del tenant FS Print en Azure AD. |
-| `MS_CLIENT_ID` | GUID de la App Registration `ProtocolosApp`. |
-| `SHAREPOINT_HOSTNAME` | `fsprintprojects.sharepoint.com`. |
-| `SHAREPOINT_SITE` | `VentasPowerBI`. |
-| `SP_CLIENTS_FILE` | Path SP del Excel `Stock Mendoza.xlsm`. |
-| `SP_INGRESOS_FILE` | Path SP del Excel `Protocolos x Ingreso OK.xlsx`. |
+| `MS_TENANT_ID` | GUID del tenant en Azure AD (pedir a TI). |
+| `MS_CLIENT_ID` | GUID de la App Registration creada para esta app. |
+| `SHAREPOINT_HOSTNAME` | `tutenant.sharepoint.com`. |
+| `SHAREPOINT_SITE` | Nombre del sitio SP donde están los datos. |
+| `SP_CLIENTS_FILE` | Path SP del Excel de clientes. |
+| `SP_INGRESOS_FILE` | Path SP del Excel de ingresos. |
 | `SP_PROTOCOLS_FOLDER` | Carpeta SP de PDFs originales. |
 | `SP_OUTPUT_FOLDER` | Carpeta SP donde van los PDFs generados. |
-| `SP_LOGS_FOLDER` / `SP_EJECUCIONES_FOLDER` / `SP_USUARIOS_FILE` | Telemetría en `Protocolos Calidad/ProtocolosApp/`. |
+| `SP_LOGS_FOLDER` / `SP_EJECUCIONES_FOLDER` / `SP_USUARIOS_FILE` | Telemetría en una sub-carpeta dedicada. |
 | `MOCK_DATA` | `true` para usar dataset de prueba. |
 | `LOG_LEVEL` | `INFO` por default. |
+
+> Ver `.env.example` para el listado completo con valores placeholder.
+
+---
+
+## Setup Azure AD (App Registration)
+
+La app necesita una **App Registration** en el tenant Azure AD para autenticarse vía Microsoft Graph y acceder a SharePoint.
+
+1. Portal: https://entra.microsoft.com → **Aplicaciones** → **Registros de aplicaciones** → **Nuevo registro**.
+2. Configurar:
+   - Nombre: `ProtocolosApp` (o lo que prefieras).
+   - Cuentas: **Solo cuentas de este directorio organizativo (Inquilino único)**.
+   - URI de redirección: **Cliente público / nativo (móvil y escritorio)** → `http://localhost`.
+3. Copiar de la pantalla **Información general**:
+   - `Id. de aplicación (cliente)` → `MS_CLIENT_ID`.
+   - `Id. de directorio (inquilino)` → `MS_TENANT_ID`.
+4. Permisos de API → **Microsoft Graph** → **Permisos delegados**:
+   - `Files.ReadWrite.All`
+   - `Sites.ReadWrite.All`
+   - `User.Read`
+5. Conceder consentimiento de administrador para el tenant (si la política lo requiere).
+6. Autenticación → **Permitir flujos de cliente público** = **Sí**.
 
 ---
 
@@ -70,9 +93,9 @@ Trae un dataset hardcoded en `data_service._mock_dataframe()` para validar la ge
    - Test rápido de conexión SQL (5s). Si falla → dialog "Verificar IP / credenciales" y la app no abre.
    - Auth Microsoft 365 vía MSAL (browser interactivo la 1ª vez, después token cacheado en `%APPDATA%`).
    - Resuelve site + drive de SharePoint.
-   - Pre-crea carpeta `Reportes Finales` si no existe.
-   - Pre-descarga Excels (Stock Mendoza + Protocolos x Ingreso OK) al cache en `%APPDATA%`.
-   - Pre-popula el index de PDFs originales (~322 archivos).
+   - Pre-crea carpeta de salida si no existe.
+   - Pre-descarga Excels (clientes + ingresos) al cache en `%APPDATA%`.
+   - Pre-popula el index de PDFs originales en memoria.
 
 2. **GUI principal** (`MainWindow`):
    - Selector **Desde / Hasta** (DateEntry).
@@ -81,18 +104,18 @@ Trae un dataset hardcoded en `data_service._mock_dataframe()` para validar la ge
    - Tabla **Detalle SAFED** con marcador rojo `⚠ FALTA PROTOCOLO` cuando no hay match.
    - Botones: Buscar / Borrar filtros / Abrir carpeta / Generar protocolos.
 
-3. **Buscar**: query SQL → enrich con TrazabilidadPapel (FSBI) → cruce con Excel ingresos → filtro Excel clientes (`Protocolos = "S"`).
+3. **Buscar**: query SQL → enrich con trazabilidad → cruce con Excel ingresos → filtro Excel clientes.
 
 4. **Generar protocolos**:
    - Si hay items sin protocolo → dialog modal con lista + botón Exportar (CSV/Excel) + opciones "Generar todos" / "Omitir problemáticos" / "Cancelar".
    - Worker en thread genera 1 PDF por comprobante = carátula + (detalle por protocolo + PDF original con header overlay) + paginación `X de N`.
-   - Sube cada PDF a `Protocolos Calidad/Reportes Finales/` vía Graph.
+   - Sube cada PDF a la carpeta SP de salida vía Graph.
    - Si el PDF ya existe en SP → dialog "Remitos ya generados" con botón "Abrir carpeta".
    - Al final: dialog "¿Abrir N borradores en Outlook?" → opcional.
 
 5. **Telemetría** (thread daemon, post-done):
-   - Sube `resumen_ejecucion_*.xlsx` a `Protocolos Calidad/ProtocolosApp/Ejecuciones/`.
-   - Sube el `.log` de la corrida a `Protocolos Calidad/ProtocolosApp/Logs/`.
+   - Sube `resumen_ejecucion_*.xlsx` a la carpeta de Ejecuciones.
+   - Sube el `.log` de la corrida a la carpeta de Logs.
    - Actualiza `usuarios.xlsx` con Email / Nombre / Sesiones / Ejecuciones.
 
 ---
@@ -145,7 +168,7 @@ pyinstaller --noconfirm --onedir --windowed --name ProtocolosApp ^
 - El `.env` está adentro del bundle. Para cambiarlo hay que re-buildear.
 - Cache de tokens, logs y Excels van a `%APPDATA%\ProtocolosApp\` (fuera de la carpeta del .exe).
 - ODBC Driver 18 se auto-instala al primer arranque si falta.
-- Compatible con cualquier user `@fs-print.com` con acceso al sitio SP.
+- Compatible con cualquier user del tenant con acceso al sitio SP.
 
 ---
 
@@ -162,11 +185,11 @@ app/
     widgets.py             DataTable, MultiSelectListbox
   db/
     connection.py          pyodbc + quick_test_connection
-    queries.py             queries SQL (FCRMVH/STRMVI/STMPDH/VTMCLH + TrazabilidadPapel)
+    queries.py             queries SQL (cabecera + items + clientes + productos + trazabilidad)
   services/
     data_service.py        fetch SQL + Excel clientes + enrich protocolos + cache disco
-    trazabilidad_service.py  lookup FSBI.dbo.TrazabilidadPapel
-    ingresos_service.py    Excel Protocolos x Ingreso OK
+    trazabilidad_service.py  lookup DB secundaria de trazabilidad
+    ingresos_service.py    Excel de cruce de ingresos
     protocol_service.py    búsqueda PDFs originales en SP
     pdf_service.py         orquesta carátula + detalle + merge por comprobante
     mail_service.py        borradores Outlook vía win32com
@@ -189,7 +212,7 @@ tools/
   SumatraPDF.exe (visor), msodbcsql18.msi (auto-instalación)
 run.py                     entrypoint para PyInstaller (imports absolutos)
 build_exe.bat              script de build
-.env, .env.example, requirements.txt
+.env.example, requirements.txt
 ```
 
 ---
@@ -197,7 +220,7 @@ build_exe.bat              script de build
 ## Mail
 
 `mail_service.open_outlook_draft` abre un **borrador en Outlook** (no envía):
-- Destinatarios: `Mail Protocolos` del Excel de clientes.
+- Destinatarios: campo `Mail Protocolos` del Excel de clientes.
 - Asunto: `Protocolos de calidad - {RazonSocial} | Remito {Comprobante}`.
 - Cuerpo HTML con lista de protocolos detectados / no encontrados.
 - Adjunto: el PDF generado (copia local en `%TEMP%\ProtocolosApp\`).
@@ -210,7 +233,12 @@ Fallback a `mailto:` si Outlook no responde (sin adjunto).
 
 - **"No se pudo establecer conexión a SQL"** al arrancar → verificar que tu IP esté autorizada en el servidor SQL y las credenciales en `.env`.
 - **"Falta ODBC Driver 18"** → aceptá el prompt para que se instale solo (puede pedir UAC). Si decís No, la app cierra.
-- **"Sin conexión a SharePoint"** → revisar internet o que tu cuenta `@fs-print.com` tenga acceso al sitio https://fsprintprojects.sharepoint.com/sites/VentasPowerBI.
+- **"Sin conexión a SharePoint"** → revisar internet o que tu cuenta tenga acceso al sitio SharePoint configurado.
 - **El .exe se cierra al abrirse** → revisar `%APPDATA%\ProtocolosApp\logs\run_*.log`.
 - **Outlook abre el viejo "Classic" y no el "New"** → el New Outlook no soporta COM/adjuntos por API. La app usa Classic Outlook (clásico). Es la única opción técnica.
-- **El popup del DateEntry "Hasta" se cierra al cambiar mes** → corregido con `_fix_date_entry_focus_bug` en `gui/main_window.py`.
+
+---
+
+## Licencia / Uso
+
+Proyecto interno. Las credenciales reales, paths y datos del tenant van en `.env` (no se commitea — ver `.gitignore`).
