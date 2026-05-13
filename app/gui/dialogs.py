@@ -289,3 +289,278 @@ class AlreadyGeneratedDialog(ctk.CTkToplevel):
 
     def show(self) -> None:
         self.wait_window()
+
+
+# =============================================================================
+# AddClientesDialog — lista + filtro + multi-select para añadir clientes al flag S
+# =============================================================================
+class AddClientesDialog(ctk.CTkToplevel):
+    """Muestra una lista filtrable de clientes que NO tienen Protocolos='S'
+    y permite seleccionar varios para añadirlos."""
+
+    def __init__(self, parent, df_no_safed: "pd.DataFrame"):
+        super().__init__(parent)
+        self.title("Añadir clientes")
+        self.geometry("640x560")
+        self.minsize(520, 420)
+
+        self.transient(parent)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
+
+        # Estructura interna: lista de dicts con codigo, razon_social, mail_actual.
+        self._all_items: list[dict] = []
+        for _, row in df_no_safed.iterrows():
+            cod = str(row.get("Código de cliente", "")).strip()
+            razon = str(row.get("Razon Social", "")).strip()
+            mail = str(row.get("Mail Protocolos", "")).strip()
+            if not cod:
+                continue
+            self._all_items.append({
+                "codigo": cod,
+                "razon_social": razon or f"(sin razón social - {cod})",
+                "mail_actual": mail,
+            })
+        # Orden alfabético por razón social.
+        self._all_items.sort(key=lambda d: d["razon_social"].upper())
+
+        self._selected_codes: set[str] = set()
+        self._check_widgets: dict[str, ctk.CTkCheckBox] = {}
+
+        self.selected: list[dict] = []   # output al cerrar con OK.
+        self._confirmed = False
+
+        self.grid_rowconfigure(2, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        # Header
+        ctk.CTkLabel(
+            self,
+            text=f"Clientes disponibles para añadir ({len(self._all_items)})",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 4))
+
+        ctk.CTkLabel(
+            self,
+            text="Buscá por nombre y marcá los que quieras añadir.",
+            font=ctk.CTkFont(size=11),
+            anchor="w",
+        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(0, 6))
+
+        # Buscador
+        import tkinter as tk
+        self._filter_var = tk.StringVar()
+        self._filter_var.trace_add("write", lambda *_: self._refresh_list())
+        ctk.CTkEntry(
+            self, placeholder_text="Filtrar...",
+            textvariable=self._filter_var,
+            font=ctk.CTkFont(size=13), height=34,
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(4, 6))
+
+        # Lista scrollable con checks
+        self._body = ctk.CTkScrollableFrame(self)
+        self._body.grid(row=2, column=0, sticky="nsew", padx=16, pady=4)
+        self._body.grid_columnconfigure(0, weight=1)
+
+        # Counter
+        self._lbl_count = ctk.CTkLabel(
+            self, text="0 seleccionado(s)", anchor="w",
+            font=ctk.CTkFont(size=11),
+        )
+        self._lbl_count.grid(row=3, column=0, sticky="w", padx=16, pady=(4, 0))
+
+        # Footer
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.grid(row=4, column=0, sticky="ew", padx=12, pady=12)
+        footer.grid_columnconfigure(0, weight=1)
+
+        btns = ctk.CTkFrame(footer, fg_color="transparent")
+        btns.grid(row=0, column=0, sticky="e")
+
+        ctk.CTkButton(
+            btns, text="Cancelar", width=120,
+            fg_color="#555555", hover_color="#3d3d3d",
+            command=self._on_cancel,
+        ).grid(row=0, column=0, padx=4)
+
+        self._btn_ok = ctk.CTkButton(
+            btns, text="Continuar", width=140,
+            command=self._on_ok,
+        )
+        self._btn_ok.grid(row=0, column=1, padx=4)
+
+        self._refresh_list()
+        self.after(50, self._center_on_parent)
+
+    def _refresh_list(self) -> None:
+        # Limpiar widgets actuales.
+        for w in self._body.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._check_widgets.clear()
+
+        q = (self._filter_var.get() or "").strip().lower()
+        items = self._all_items
+        if q:
+            items = [it for it in items if q in it["razon_social"].lower()]
+
+        for i, it in enumerate(items):
+            cod = it["codigo"]
+            import tkinter as tk
+            var = tk.BooleanVar(value=cod in self._selected_codes)
+            cb = ctk.CTkCheckBox(
+                self._body,
+                text=it["razon_social"],
+                variable=var,
+                command=lambda c=cod, v=var: self._on_toggle(c, v),
+                font=ctk.CTkFont(size=12),
+            )
+            cb.grid(row=i, column=0, sticky="w", padx=8, pady=3)
+            self._check_widgets[cod] = cb
+
+        self._update_count()
+
+    def _on_toggle(self, codigo: str, var) -> None:
+        if var.get():
+            self._selected_codes.add(codigo)
+        else:
+            self._selected_codes.discard(codigo)
+        self._update_count()
+
+    def _update_count(self) -> None:
+        self._lbl_count.configure(text=f"{len(self._selected_codes)} seleccionado(s)")
+
+    def _on_cancel(self) -> None:
+        self._confirmed = False
+        self.destroy()
+
+    def _on_ok(self) -> None:
+        if not self._selected_codes:
+            messagebox.showinfo(
+                "Sin selección",
+                "Marcá al menos un cliente antes de continuar.",
+                parent=self,
+            )
+            return
+        # Armar lista de seleccionados en el orden original.
+        by_code = {it["codigo"]: it for it in self._all_items}
+        self.selected = [by_code[c] for c in self._selected_codes if c in by_code]
+        self._confirmed = True
+        self.destroy()
+
+    def _center_on_parent(self) -> None:
+        try:
+            self.update_idletasks()
+            parent = self.master
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            w = self.winfo_width()
+            h = self.winfo_height()
+            x = px + (pw - w) // 2
+            y = py + (ph - h) // 2
+            self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+
+    def show(self) -> list[dict]:
+        """Bloquea hasta cerrar. Devuelve lista de clientes seleccionados o []."""
+        self.wait_window()
+        return self.selected if self._confirmed else []
+
+
+# =============================================================================
+# AskMailsDialog — pide mails para UN cliente (separados por ';')
+# =============================================================================
+class AskMailsDialog(ctk.CTkToplevel):
+    def __init__(self, parent, razon_social: str, mail_actual: str = ""):
+        super().__init__(parent)
+        self.title("Mails del cliente")
+        self.geometry("560x240")
+        self.resizable(False, False)
+
+        self.transient(parent)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self._on_skip)
+
+        self.mails: str | None = None
+        self.skipped: bool = False
+
+        self.grid_columnconfigure(0, weight=1)
+
+        ctk.CTkLabel(
+            self, text=razon_social,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            anchor="w", wraplength=500, justify="left",
+        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 4))
+
+        ctk.CTkLabel(
+            self,
+            text="Ingresá los mails (separados por  ;  para varios):",
+            anchor="w",
+            font=ctk.CTkFont(size=12),
+        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(6, 4))
+
+        import tkinter as tk
+        self._var = tk.StringVar(value=mail_actual or "")
+        ctk.CTkEntry(
+            self, textvariable=self._var,
+            font=ctk.CTkFont(size=13), height=36,
+        ).grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 12))
+
+        footer = ctk.CTkFrame(self, fg_color="transparent")
+        footer.grid(row=3, column=0, sticky="ew", padx=12, pady=12)
+        footer.grid_columnconfigure(0, weight=1)
+
+        btns = ctk.CTkFrame(footer, fg_color="transparent")
+        btns.grid(row=0, column=0, sticky="e")
+
+        ctk.CTkButton(
+            btns, text="Saltar", width=120,
+            fg_color="#555555", hover_color="#3d3d3d",
+            command=self._on_skip,
+        ).grid(row=0, column=0, padx=4)
+
+        ctk.CTkButton(
+            btns, text="Confirmar", width=140,
+            command=self._on_confirm,
+            fg_color="#1f6f3f", hover_color="#155226",
+        ).grid(row=0, column=1, padx=4)
+
+        self.after(50, self._center_on_parent)
+
+    def _center_on_parent(self) -> None:
+        try:
+            self.update_idletasks()
+            parent = self.master
+            px = parent.winfo_rootx()
+            py = parent.winfo_rooty()
+            pw = parent.winfo_width()
+            ph = parent.winfo_height()
+            w = self.winfo_width()
+            h = self.winfo_height()
+            x = px + (pw - w) // 2
+            y = py + (ph - h) // 2
+            self.geometry(f"+{max(0, x)}+{max(0, y)}")
+        except Exception:
+            pass
+
+    def _on_skip(self) -> None:
+        self.skipped = True
+        self.mails = None
+        self.destroy()
+
+    def _on_confirm(self) -> None:
+        val = (self._var.get() or "").strip()
+        self.skipped = False
+        self.mails = val
+        self.destroy()
+
+    def show(self) -> tuple[bool, str | None]:
+        """Bloquea hasta cerrar. Devuelve (skipped, mails)."""
+        self.wait_window()
+        return self.skipped, self.mails

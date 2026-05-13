@@ -39,7 +39,7 @@ _SP_PATH_LOCKS: dict[str, threading.Lock] = {}
 _SP_LOCKS_GUARD = threading.Lock()
 
 
-def _sp_get_or_download(sp_path: str) -> bytes:
+def _sp_get_or_download(sp_path: str, *, verify_fresh: bool = False) -> bytes:
     """Devuelve los bytes del Excel.
 
     Estrategia 3 niveles:
@@ -48,20 +48,26 @@ def _sp_get_or_download(sp_path: str) -> bytes:
          metadata a SharePoint para comparar `lastModifiedDateTime`.
          Si no cambió, leer del disco (~10ms).
       3) Descargar de SharePoint y guardar a disco.
+
+    `verify_fresh=True` salta el cache de memoria y obliga a verificar contra
+    SharePoint (igual usa el disk cache si no hubo cambios). Útil cuando
+    vamos a MODIFICAR el archivo y queremos minimizar concurrencia.
     """
-    cached = _SP_EXCEL_CACHE.get(sp_path)
-    if cached is not None:
-        log.info("Cache HIT (memoria): %s", sp_path)
-        return cached
+    if not verify_fresh:
+        cached = _SP_EXCEL_CACHE.get(sp_path)
+        if cached is not None:
+            log.info("Cache HIT (memoria): %s", sp_path)
+            return cached
 
     with _SP_LOCKS_GUARD:
         lock = _SP_PATH_LOCKS.setdefault(sp_path, threading.Lock())
 
     with lock:
-        cached = _SP_EXCEL_CACHE.get(sp_path)
-        if cached is not None:
-            log.info("Cache HIT (memoria, post-lock): %s", sp_path)
-            return cached
+        if not verify_fresh:
+            cached = _SP_EXCEL_CACHE.get(sp_path)
+            if cached is not None:
+                log.info("Cache HIT (memoria, post-lock): %s", sp_path)
+                return cached
 
         from ..sharepoint.client import get_client
         from ..utils import disk_cache
@@ -131,6 +137,235 @@ def warm_up_excels() -> None:
 # ---------------------------------------------------------------------------
 # Excel de clientes (filtro Protocolos = "S")
 # ---------------------------------------------------------------------------
+def _invalidate_clients_cache() -> None:
+    """Borra el cache (memoria + disco) del Excel de clientes para forzar
+    re-descarga la próxima vez."""
+    s = get_settings()
+    _SP_EXCEL_CACHE.pop(s.sp_clients_file, None)
+    if s.storage_backend == "sharepoint" and s.sp_clients_file:
+        try:
+            from ..utils import disk_cache as _dc
+            data_p, meta_p = _dc.cache_paths(s.sp_clients_file)
+            for p in (data_p, meta_p):
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        except Exception as e:
+            log.warning("No se pudo invalidar disk cache de clientes: %s", e)
+
+
+def load_clientes_all() -> pd.DataFrame:
+    """Carga TODOS los clientes (sin filtrar por flag 'Protocolos').
+
+    Reutiliza el cache (memoria/disco) si está disponible — la verificación
+    de versión real contra SharePoint se hace en `update_clientes_in_excel`
+    justo antes del save para minimizar la ventana de concurrencia.
+    """
+    s = get_settings()
+
+    if s.storage_backend == "sharepoint":
+        raw = _sp_get_or_download(s.sp_clients_file)
+        df = pd.read_excel(
+            io.BytesIO(raw),
+            sheet_name=s.clients_sheet,
+            engine="openpyxl",
+            dtype=str,
+        )
+    else:
+        if not s.clients_xlsx.exists():
+            raise FileNotFoundError(f"Excel de clientes no encontrado: {s.clients_xlsx}")
+        try:
+            df = pd.read_excel(
+                s.clients_xlsx, sheet_name=s.clients_sheet,
+                engine="openpyxl", dtype=str,
+            )
+        except PermissionError:
+            raw = read_file_shared(s.clients_xlsx)
+            df = pd.read_excel(
+                io.BytesIO(raw), sheet_name=s.clients_sheet,
+                engine="openpyxl", dtype=str,
+            )
+
+    df.columns = [str(c).replace("\xa0", " ").strip() for c in df.columns]
+    for c in _CLIENT_COLUMNS_EXCEL:
+        if c not in df.columns:
+            df[c] = ""
+    for c in _CLIENT_COLUMNS_EXCEL:
+        df[c] = df[c].fillna("").astype(str).str.strip()
+    return df[_CLIENT_COLUMNS_EXCEL].reset_index(drop=True)
+
+
+def update_clientes_in_excel(updates: dict[str, str]) -> int:
+    """Aplica `updates` al Excel `Stock Mendoza.xlsm` hoja `Clientes`.
+
+    `updates`: {"código_cliente": "mails_separados_por_;"}.
+    Para cada código, setea Protocolos="S" y Mail Protocolos=<mails>.
+
+    En backend SharePoint usa **Microsoft Graph Excel API** — edita celdas
+    directamente sin descargar/subir el archivo. ~1-3s vs ~70-90s del path
+    openpyxl. Preserva macros automáticamente (la API solo toca las celdas
+    pedidas).
+
+    En backend local cae al método clásico con openpyxl.
+    Devuelve el N de filas modificadas.
+    """
+    if not updates:
+        return 0
+
+    s = get_settings()
+    log.info("update_clientes_in_excel: %d cliente(s) a actualizar", len(updates))
+
+    if s.storage_backend == "sharepoint":
+        modified = _update_clientes_via_graph_api(updates)
+    else:
+        modified = _update_clientes_via_openpyxl(updates)
+
+    # Invalidar cache para que el próximo load_clientes_all baje la versión actualizada.
+    _invalidate_clients_cache()
+    return modified
+
+
+def _update_clientes_via_graph_api(updates: dict[str, str]) -> int:
+    """Path SharePoint: edita celdas via Microsoft Graph Excel API."""
+    from ..sharepoint.client import get_client, SharePointError
+    from ..sharepoint.excel_api import ExcelSession, col_letter
+
+    s = get_settings()
+    client = get_client()
+
+    item = client.get_item(s.sp_clients_file)
+    if not item:
+        raise FileNotFoundError(
+            f"No se encontró el archivo de clientes en SharePoint: {s.sp_clients_file}"
+        )
+    item_id = item["id"]
+    sheet = s.clients_sheet or "Clientes"
+
+    with ExcelSession(client, item_id, persist_changes=True) as session:
+        # 1) Headers (fila 1).
+        header_rows = session.get_range(sheet, "1:1")
+        if not header_rows or not header_rows[0]:
+            raise ValueError(f"Hoja '{sheet}': fila de encabezados vacía.")
+        raw_headers = header_rows[0]
+        headers_norm = [
+            (str(h).replace("\xa0", " ").strip() if h else "") for h in raw_headers
+        ]
+
+        def _col_index(name: str) -> int:
+            try:
+                return headers_norm.index(name) + 1
+            except ValueError:
+                raise ValueError(
+                    f"Falta columna '{name}' en hoja '{sheet}'. "
+                    f"Encontradas: {[h for h in headers_norm if h]}"
+                )
+
+        col_codigo = _col_index("Código de cliente")
+        col_protocolos = _col_index("Protocolos")
+        col_mail = _col_index("Mail Protocolos")
+
+        L_codigo = col_letter(col_codigo)
+        L_protocolos = col_letter(col_protocolos)
+        L_mail = col_letter(col_mail)
+
+        # 2) usedRange para limitar la lectura de la columna código.
+        first_row, last_row = session.used_range_rows(sheet)
+        if last_row < 2:
+            log.warning("Hoja '%s' sin filas de datos.", sheet)
+            return 0
+        # Saltamos la fila 1 (headers).
+        data_start = max(first_row, 2)
+
+        codigo_range = session.get_range(
+            sheet, f"{L_codigo}{data_start}:{L_codigo}{last_row}"
+        )
+        code_to_row: dict[str, int] = {}
+        for offset, row in enumerate(codigo_range):
+            val = row[0] if row else None
+            if val is None or val == "":
+                continue
+            code = str(val).strip()
+            if code:
+                code_to_row[code] = data_start + offset
+
+        # 3) Aplicar updates.
+        modified = 0
+        updates_norm = {str(k).strip(): str(v) for k, v in updates.items()}
+        # Mismo PATCH para Protocolos+Mail si están adyacentes (mejor latencia).
+        protocolos_adyacente_mail = (col_mail - col_protocolos) == 1
+        for cod, mails in updates_norm.items():
+            row_num = code_to_row.get(cod)
+            if row_num is None:
+                log.warning("Cliente '%s' no encontrado en hoja '%s'.", cod, sheet)
+                continue
+            try:
+                if protocolos_adyacente_mail:
+                    addr = f"{L_protocolos}{row_num}:{L_mail}{row_num}"
+                    session.patch_range(sheet, addr, [["S", mails]])
+                else:
+                    session.patch_range(sheet, f"{L_protocolos}{row_num}", [["S"]])
+                    session.patch_range(sheet, f"{L_mail}{row_num}", [[mails]])
+            except SharePointError as e:
+                log.exception("PATCH falló para cliente %s: %s", cod, e)
+                raise
+            modified += 1
+            log.info("Cliente %s → Protocolos=S, Mail='%s'", cod, mails)
+
+    log.info("Stock Mendoza actualizado vía Graph Excel API: %d fila(s).", modified)
+    return modified
+
+
+def _update_clientes_via_openpyxl(updates: dict[str, str]) -> int:
+    """Path local (backend != sharepoint): edita con openpyxl + keep_vba."""
+    s = get_settings()
+    raw = s.clients_xlsx.read_bytes()
+
+    import openpyxl
+    wb = openpyxl.load_workbook(io.BytesIO(raw), keep_vba=True, data_only=False)
+    if s.clients_sheet not in wb.sheetnames:
+        raise ValueError(
+            f"Hoja '{s.clients_sheet}' no encontrada. Disponibles: {wb.sheetnames}"
+        )
+    ws = wb[s.clients_sheet]
+
+    headers: dict[str, int] = {}
+    for col_idx, cell in enumerate(ws[1], start=1):
+        if cell.value is None:
+            continue
+        name = str(cell.value).replace("\xa0", " ").strip()
+        headers[name] = col_idx
+
+    required = ["Código de cliente", "Protocolos", "Mail Protocolos"]
+    for req in required:
+        if req not in headers:
+            raise ValueError(
+                f"Falta columna '{req}'. Encontradas: {list(headers.keys())}"
+            )
+
+    col_codigo = headers["Código de cliente"]
+    col_protocolos = headers["Protocolos"]
+    col_mail = headers["Mail Protocolos"]
+
+    modified = 0
+    updates_norm = {str(k).strip(): str(v) for k, v in updates.items()}
+    for row in ws.iter_rows(min_row=2):
+        cod_cell = row[col_codigo - 1]
+        cod_val = str(cod_cell.value).strip() if cod_cell.value is not None else ""
+        if not cod_val:
+            continue
+        if cod_val in updates_norm:
+            row[col_protocolos - 1].value = "S"
+            row[col_mail - 1].value = updates_norm[cod_val]
+            modified += 1
+            log.info("Cliente %s → Protocolos=S, Mail='%s'", cod_val, updates_norm[cod_val])
+
+    out_buf = io.BytesIO()
+    wb.save(out_buf)
+    s.clients_xlsx.write_bytes(out_buf.getvalue())
+    return modified
+
+
 def load_clientes_protocolos() -> pd.DataFrame:
     s = get_settings()
 
@@ -559,6 +794,13 @@ def build_detail_view(df: pd.DataFrame) -> pd.DataFrame:
     )
     sub["Serie"] = sub["Serie"].map(format_serie)
 
+    # En el df original existen DOS conceptos de "Producto":
+    #   - "Producto" (código de artículo SQL, ej. "ART-123") — interno.
+    #   - "Descripcion2" (texto humano-legible, ej. "OPP TC WHITE GLOSS AP903").
+    # La UI muestra Descripcion2 bajo la etiqueta "Producto", entonces dropeamos
+    # el código antes del rename para evitar columnas duplicadas.
+    if "Producto" in sub.columns:
+        sub = sub.drop(columns=["Producto"])
     sub = sub.rename(columns={
         "Código de Cliente": "Cliente",
         "Descripcion2": "Producto",
