@@ -288,7 +288,7 @@ class MainWindow(ctk.CTk):
         self.tbl_summary = DataTable(right, columns=SUMMARY_COLS, widths=SUMMARY_WIDTHS, height=6)
         self.tbl_summary.grid(row=1, column=0, sticky="nsew", padx=8, pady=(0, 6))
 
-        ctk.CTkLabel(right, text="Detalle (TIPPRO = SAFED)",
+        ctk.CTkLabel(right, text="Detalle Remito",
                      anchor="w", font=ctk.CTkFont(weight="bold")
                      ).grid(row=2, column=0, sticky="ew", padx=8, pady=(2, 2))
         self.tbl_detail = DataTable(right, columns=DETAIL_COLS, widths=DETAIL_WIDTHS, height=10)
