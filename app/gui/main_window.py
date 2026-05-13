@@ -22,7 +22,12 @@ from ..utils.validators import ensure_readable, ensure_writable
 from ..services import mail_service
 from ..services.pdf_service import ComprobanteResult
 from ..workers.generation_worker import GenerationWorker, ProgressEvent
-from .dialogs import AlreadyGeneratedDialog, MissingProtocolsDialog
+from .dialogs import (
+    AddClientesDialog,
+    AlreadyGeneratedDialog,
+    AskMailsDialog,
+    MissingProtocolsDialog,
+)
 from .widgets import DataTable, MultiSelectListbox
 
 log = get_logger(__name__)
@@ -179,9 +184,9 @@ class MainWindow(ctk.CTk):
         # Filtros
         filters = ctk.CTkFrame(self)
         filters.grid(row=1, column=0, sticky="ew", padx=12, pady=(12, 6))
-        for i in range(9):
+        for i in range(10):
             filters.grid_columnconfigure(i, weight=0)
-        filters.grid_columnconfigure(7, weight=1)  # spacer expansible
+        filters.grid_columnconfigure(8, weight=1)  # spacer expansible
 
         date_font = ("Segoe UI", 16, "bold")
         lbl_font = ctk.CTkFont(size=15, weight="bold")
@@ -224,13 +229,20 @@ class MainWindow(ctk.CTk):
         )
         self.btn_open_folder.grid(row=0, column=6, padx=4, pady=10)
 
-        # col 7 = spacer expansible (weight=1) → empuja "Generar" al borde derecho
+        self.btn_add_clientes = ctk.CTkButton(
+            filters, text="Añadir clientes", width=140,
+            command=self._on_add_clientes,
+            fg_color="#2c5282", hover_color="#1f3c66",
+        )
+        self.btn_add_clientes.grid(row=0, column=7, padx=4, pady=10)
+
+        # col 8 = spacer expansible (weight=1) → empuja "Generar" al borde derecho
 
         self.btn_generar = ctk.CTkButton(
             filters, text="Generar protocolos", width=170,
             state="disabled", command=self._on_generar,
         )
-        self.btn_generar.grid(row=0, column=8, padx=(20, 10), pady=10, sticky="e")
+        self.btn_generar.grid(row=0, column=9, padx=(20, 10), pady=10, sticky="e")
 
         # Entry de carpeta de salida — siempre creado por compatibilidad,
         # pero solo se muestra en backend "local". En "sharepoint" la ruta
@@ -437,6 +449,114 @@ class MainWindow(ctk.CTk):
         self.btn_generar.configure(state="disabled")
         self.progress.set(0)
         self._log_console("Filtros y datos limpiados.")
+
+    def _on_add_clientes(self) -> None:
+        """Flow para añadir clientes al listado (set Protocolos='S' + mails).
+
+        Sync para simplificar (download + dialogs + upload). La GUI puede
+        verse trabada brevemente durante la descarga/subida del Excel
+        (~5-10s en total con red estable).
+        """
+        self.btn_add_clientes.configure(state="disabled")
+        self.lbl_status.configure(text="Descargando lista de clientes...")
+        self._log_console("Descargando lista completa de clientes desde SharePoint...")
+        self.update_idletasks()
+
+        try:
+            df_all = data_service.load_clientes_all()
+        except Exception as e:
+            log.exception("Error al cargar clientes para añadir")
+            messagebox.showerror("Error", f"No se pudo cargar el listado de clientes:\n{e}")
+            self.btn_add_clientes.configure(state="normal")
+            self.lbl_status.configure(text="Listo.")
+            return
+
+        if "Protocolos" not in df_all.columns:
+            messagebox.showerror(
+                "Excel inválido",
+                "No se encontró la columna 'Protocolos' en la hoja Clientes.",
+            )
+            self.btn_add_clientes.configure(state="normal")
+            self.lbl_status.configure(text="Listo.")
+            return
+
+        mask_no_s = (
+            df_all["Protocolos"].fillna("").astype(str).str.strip().str.upper() != "S"
+        )
+        df_no_s = df_all[mask_no_s].copy()
+        if df_no_s.empty:
+            messagebox.showinfo(
+                "Sin clientes pendientes",
+                "Todos los clientes del Excel ya tienen el flag de protocolos en 'S'.",
+            )
+            self.btn_add_clientes.configure(state="normal")
+            self.lbl_status.configure(text="Listo.")
+            return
+
+        self.lbl_status.configure(text=f"{len(df_no_s)} cliente(s) sin marca de protocolos.")
+        self.update_idletasks()
+
+        selected = AddClientesDialog(self, df_no_s).show()
+        if not selected:
+            self._log_console("Añadir clientes: cancelado.")
+            self.btn_add_clientes.configure(state="normal")
+            self.lbl_status.configure(text="Listo.")
+            return
+
+        updates: dict[str, str] = {}
+        for cli in selected:
+            skipped, mails = AskMailsDialog(
+                self,
+                razon_social=cli["razon_social"],
+                mail_actual=cli["mail_actual"],
+            ).show()
+            if skipped:
+                self._log_console(f"  · {cli['razon_social']}: saltado.")
+                continue
+            updates[cli["codigo"]] = mails or ""
+
+        if not updates:
+            messagebox.showinfo("Sin cambios", "No se confirmó ningún cliente.")
+            self.btn_add_clientes.configure(state="normal")
+            self.lbl_status.configure(text="Listo.")
+            return
+
+        self.lbl_status.configure(text=f"Guardando {len(updates)} cliente(s) en SharePoint...")
+        self._log_console(f"Aplicando cambios a {len(updates)} cliente(s) en Stock Mendoza.xlsm...")
+        self.update_idletasks()
+
+        try:
+            n = data_service.update_clientes_in_excel(updates)
+        except Exception as e:
+            log.exception("Error al actualizar clientes en Excel")
+            err_str = str(e)
+            if "resourceLocked" in err_str or " 423 " in err_str or err_str.startswith("chunk upload falló: 423"):
+                messagebox.showerror(
+                    "Excel bloqueado",
+                    "El archivo Stock Mendoza.xlsm está bloqueado en SharePoint.\n\n"
+                    "Causas más comunes:\n"
+                    "  • Lo tenés abierto en Excel (cerralo).\n"
+                    "  • Otra persona lo está editando online.\n"
+                    "  • OneDrive sigue sincronizando.\n\n"
+                    "Cerralo en Excel y volvé a intentar.",
+                )
+            else:
+                messagebox.showerror(
+                    "Error al guardar",
+                    f"No se pudieron guardar los cambios:\n{e}",
+                )
+            self.btn_add_clientes.configure(state="normal")
+            self.lbl_status.configure(text="Listo.")
+            return
+
+        self._log_console(f"OK · {n} cliente(s) añadidos al listado.")
+        messagebox.showinfo(
+            "Clientes añadidos",
+            f"{n} cliente(s) añadidos al listado.\n\n"
+            "Volvé a apretar Buscar para verlos en las listas.",
+        )
+        self.btn_add_clientes.configure(state="normal")
+        self.lbl_status.configure(text="Listo.")
 
     def _on_generar(self) -> None:
         log.info("_on_generar invocado")

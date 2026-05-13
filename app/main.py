@@ -3,7 +3,18 @@ from __future__ import annotations
 
 import sys
 import traceback
+import warnings
 from tkinter import messagebox
+
+# Silencia el aviso de pandas cuando `read_sql` recibe un pyodbc connection
+# en lugar de SQLAlchemy. Es informativo, NO un error: nuestras queries son
+# parametrizadas y funcionan bien. Migrar a SQLAlchemy sería un cambio mayor
+# sin beneficio real para este caso de uso (queries de lectura puntuales).
+warnings.filterwarnings(
+    "ignore",
+    message="pandas only supports SQLAlchemy connectable.*",
+    category=UserWarning,
+)
 
 from .config import get_settings
 from .utils.logger import new_run_id, setup_logger
