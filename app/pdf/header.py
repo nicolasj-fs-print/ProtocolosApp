@@ -7,11 +7,14 @@ import fitz  # PyMuPDF
 
 from ..utils.paths import resource_path
 
-_HEADER_HEIGHT = 42  # pt
+_HEADER_HEIGHT = 42      # pt — alto de la barra (NO se mueve la línea inferior)
 _PAD = 10
 _LOGO_W = 70
 _LOGO_PAD_Y = 4
 _TEXT_FONTSIZE = 13
+_TEXT_OFFSET_FROM_BOTTOM = 6   # pt — distancia desde la línea inferior hasta el baseline del texto.
+                               # MENOR = texto MÁS ABAJO (más cerca de la línea).
+                               # MAYOR = texto más arriba.
 
 
 def add_header_to_pdf(pdf_bytes: bytes, protocolo_id: str) -> bytes:
@@ -45,9 +48,10 @@ def add_header_to_pdf(pdf_bytes: bytes, protocolo_id: str) -> bytes:
                 overlay=True,
             )
 
-            # Texto "Protocolo: XXXX"
+            # Texto "Protocolo: XXXX" — bajado para dejar margen arriba a la paginación.
             try:
-                text_y = rect.y0 + _HEADER_HEIGHT / 2 + _TEXT_FONTSIZE / 3
+                # baseline del texto pegado a la línea inferior del header.
+                text_y = rect.y0 + _HEADER_HEIGHT - _TEXT_OFFSET_FROM_BOTTOM
                 new_page.insert_text(
                     (rect.x0 + _PAD, text_y),
                     f"Protocolo: {protocolo_id}",

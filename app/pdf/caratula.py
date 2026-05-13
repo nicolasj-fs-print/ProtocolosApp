@@ -1,4 +1,4 @@
-"""Generación de la carátula consolidada por comprobante."""
+"""Generación de la carátula consolidada por remito."""
 from __future__ import annotations
 
 import io
@@ -19,11 +19,11 @@ def build_caratula(meta: CaratulaMeta, rows: Iterable[dict]) -> bytes:
         rightMargin=st.MARGIN,
         topMargin=st.MARGIN,
         bottomMargin=st.MARGIN,
-        title=f"Protocolos {meta.comprobante}",
+        title=f"Protocolo {meta.comprobante}",
         author="FS Print & Projects",
     )
     story: list = []
-    story.extend(build_header_block("Protocolos de Calidad", meta))
+    story.extend(build_header_block("Protocolo de Calidad", meta))
     story.append(build_products_table(list(rows)))
     doc.build(story)
     return buf.getvalue()

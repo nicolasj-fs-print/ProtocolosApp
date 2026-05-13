@@ -521,7 +521,7 @@ def build_summary_view(df: pd.DataFrame) -> pd.DataFrame:
     """
     if df.empty:
         return pd.DataFrame(columns=[
-            "Cliente", "Comprobante", "Fecha", "M2", "Observaciones",
+            "Cliente", "Remito", "Fecha", "M2", "Observaciones",
         ])
 
     df = df.copy()
@@ -532,20 +532,20 @@ def build_summary_view(df: pd.DataFrame) -> pd.DataFrame:
         Fecha=("Fecha", "first"),
         M2=("#m2", "sum"),
         Observaciones=("Observaciones", "first"),
-    ).reset_index().rename(columns={"#Comprobante": "Comprobante"})
+    ).reset_index().rename(columns={"#Comprobante": "Remito"})
 
     grouped["Fecha"] = pd.to_datetime(grouped["Fecha"], errors="coerce").dt.strftime("%d-%m-%Y").fillna("")
     grouped["M2"] = grouped["M2"].map(lambda x: f"{int(round(x))}" if pd.notna(x) else "")
-    return grouped[["Cliente", "Comprobante", "Fecha", "M2", "Observaciones"]]
+    return grouped[["Cliente", "Remito", "Fecha", "M2", "Observaciones"]]
 
 
 def build_detail_view(df: pd.DataFrame) -> pd.DataFrame:
     """Tabla 2: detalle por línea, filtrando STMPDH_TIPPRO == 'SAFED'."""
     if df.empty:
         return pd.DataFrame(columns=[
-            "Cliente", "Protocolo Serie LF", "Protocolo",
+            "Cliente", "LF - Producto", "Protocolo",
             "Ancho", "Largo", "M2", "Serie",
-            "Comprobante", "Descripción"
+            "Remito", "Producto"
         ])
     sub = df[df["TipoProducto"].astype(str).str.upper() == "SAFED"].copy()
     if "Protocolo" not in sub.columns:
@@ -561,13 +561,14 @@ def build_detail_view(df: pd.DataFrame) -> pd.DataFrame:
 
     sub = sub.rename(columns={
         "Código de Cliente": "Cliente",
-        "Descripcion2": "Descripción",
-        "#Comprobante": "Comprobante",
+        "Descripcion2": "Producto",
+        "#Comprobante": "Remito",
+        "Protocolo Serie LF": "LF - Producto",
     })
     return sub[[
-        "Cliente", "Protocolo Serie LF", "Protocolo",
+        "Cliente", "LF - Producto", "Protocolo",
         "Ancho", "Largo", "M2", "Serie",
-        "Comprobante", "Descripción",
+        "Remito", "Producto",
     ]].reset_index(drop=True)
 
 

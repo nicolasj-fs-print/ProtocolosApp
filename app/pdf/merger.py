@@ -6,10 +6,12 @@ from typing import Iterable
 
 import fitz
 
-# Paginación: "1 de N" en la esquina superior izquierda
+# Paginación: "1 de N" en la esquina superior izquierda.
+# Tocá _PAGINATION_X / _PAGINATION_Y para mover el numerador.
 _PAGINATION_FONTSIZE = 7
-_PAGINATION_X = 10
-_PAGINATION_Y = 10
+_PAGINATION_X = 12       # pt desde el borde izquierdo
+_PAGINATION_Y = 22       # pt desde el borde superior (más alto = más abajo).
+                         # Antes era 10 y se cortaba al imprimir.
 _PAGINATION_COLOR = (0.4, 0.4, 0.4)
 
 

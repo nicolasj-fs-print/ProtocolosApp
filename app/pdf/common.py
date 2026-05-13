@@ -21,6 +21,34 @@ from ..utils.format import format_serie
 from ..utils.paths import resource_path
 from . import styles as st
 
+# ============================================================
+# CONFIG DE LOGOS Y MÁRGENES — tocá acá para mover/redimensionar.
+# Todas las unidades en mm.
+# ============================================================
+
+# Tamaños (alto). Ancho se calcula automático manteniendo proporción.
+LOGO_FS_HEIGHT_MM = 20       # logo FS (izquierda) — más grande.
+LOGO_FED_HEIGHT_MM = 14      # logo Fedrigoni (derecha) — más chico.
+
+# Ancho reservado para cada celda de logo (caja contenedora).
+LOGO_COLUMN_WIDTH_MM = 45
+
+# Posición FS (izquierda):
+#   X → LEFT_PADDING positivo lo empuja hacia la derecha (alejándolo del borde izquierdo).
+#   Y → TOP_PADDING positivo lo empuja hacia abajo.
+LOGO_FS_LEFT_PADDING_MM = 0
+LOGO_FS_TOP_PADDING_MM = 0
+
+# Posición Fedrigoni (derecha):
+#   X → RIGHT_PADDING positivo lo empuja hacia la izquierda (alejándolo del borde derecho).
+#   Y → TOP_PADDING positivo lo empuja hacia abajo.
+LOGO_FED_RIGHT_PADDING_MM = 0
+LOGO_FED_TOP_PADDING_MM = 9
+
+# Spacing vertical del bloque header completo dentro del PDF.
+TOP_SPACING_MM = 0           # margen arriba del header (más aire desde el borde superior).
+BOTTOM_SPACING_MM = 4        # spacer entre header y tabla de productos.
+
 
 @dataclass
 class CaratulaMeta:
@@ -52,9 +80,10 @@ def _logo_image(rel_path: str, height_mm: float = 14) -> Image | None:
 
 
 def build_header_block(title: str, meta: CaratulaMeta) -> list:
-    """Bloque superior con título + datos cliente + logos a la derecha."""
-    logo_fed = _logo_image("assets/logo_fedrigoni.png")
-    logo_fs = _logo_image("assets/logo_fs.png")
+    """Bloque superior con logo FS (izquierda) + título/datos (centro) +
+    logo Fedrigoni (derecha)."""
+    logo_fs = _logo_image("assets/logo_fs.png", height_mm=LOGO_FS_HEIGHT_MM)
+    logo_fed = _logo_image("assets/logo_fedrigoni.png", height_mm=LOGO_FED_HEIGHT_MM)
 
     info_html = (
         f"<b>{title}</b><br/>"
@@ -67,39 +96,49 @@ def build_header_block(title: str, meta: CaratulaMeta) -> list:
     )
     info = Paragraph(info_html, st.TITLE)
 
-    logos_cell = []
-    if logo_fed is not None:
-        logos_cell.append(logo_fed)
-    if logo_fs is not None:
-        logos_cell.append(logo_fs)
-    if not logos_cell:
-        logos_cell.append(Paragraph("", st.SMALL))
+    fs_cell = logo_fs if logo_fs is not None else Paragraph("", st.SMALL)
+    fed_cell = logo_fed if logo_fed is not None else Paragraph("", st.SMALL)
 
-    logos_table = Table(
-        [[c] for c in logos_cell],
-        colWidths=[40 * mm],
-        hAlign="RIGHT",
-    )
-    logos_table.setStyle(TableStyle([
-        ("ALIGN", (0, 0), (-1, -1), "RIGHT"),
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 2),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-    ]))
-
+    # Layout: [info izquierda] [FS medio] [Fed derecha]
+    info_width_mm = 170 - 2 * LOGO_COLUMN_WIDTH_MM  # ancho usable ~A4 - márgenes
     container = Table(
-        [[info, logos_table]],
-        colWidths=[110 * mm, 60 * mm],
+        [[info, fs_cell, fed_cell]],
+        colWidths=[
+            info_width_mm * mm,
+            LOGO_COLUMN_WIDTH_MM * mm,
+            LOGO_COLUMN_WIDTH_MM * mm,
+        ],
     )
     container.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 0),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ("VALIGN", (0, 0), (0, 0), "MIDDLE"),  # info centrada verticalmente
+        ("VALIGN", (1, 0), (2, 0), "TOP"),     # logos pegados arriba (alineados a "Protocolo de Calidad")
+        ("ALIGN", (0, 0), (0, 0), "LEFT"),     # info pegada a la izquierda
+        ("ALIGN", (1, 0), (1, 0), "LEFT"),     # FS al medio (alineado a la izquierda de su celda)
+        ("ALIGN", (2, 0), (2, 0), "RIGHT"),    # Fed a la derecha
+
+        # Info (columna 0) sin padding extra.
+        ("LEFTPADDING", (0, 0), (0, 0), 0),
+        ("RIGHTPADDING", (0, 0), (0, 0), 0),
+        ("TOPPADDING", (0, 0), (0, 0), 2),
+        ("BOTTOMPADDING", (0, 0), (0, 0), 6),
+
+        # FS (columna 1): X = LEFTPADDING (positivo = FS más a la derecha).
+        ("LEFTPADDING", (1, 0), (1, 0), LOGO_FS_LEFT_PADDING_MM * mm),
+        ("RIGHTPADDING", (1, 0), (1, 0), 0),
+        ("TOPPADDING", (1, 0), (1, 0), LOGO_FS_TOP_PADDING_MM * mm + 2),
+        ("BOTTOMPADDING", (1, 0), (1, 0), 6),
+
+        # Fedrigoni (columna 2): X = RIGHTPADDING (positivo = Fed más a la izquierda).
+        ("LEFTPADDING", (2, 0), (2, 0), 0),
+        ("RIGHTPADDING", (2, 0), (2, 0), LOGO_FED_RIGHT_PADDING_MM * mm),
+        ("TOPPADDING", (2, 0), (2, 0), LOGO_FED_TOP_PADDING_MM * mm + 2),
+        ("BOTTOMPADDING", (2, 0), (2, 0), 6),
     ]))
-    return [container, Spacer(1, 4 * mm)]
+    return [
+        Spacer(1, TOP_SPACING_MM * mm),    # ← margen arriba (configurable).
+        container,
+        Spacer(1, BOTTOM_SPACING_MM * mm),
+    ]
 
 
 def build_products_table(rows: Iterable[dict]) -> Table:

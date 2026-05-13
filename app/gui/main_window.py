@@ -31,13 +31,13 @@ APP_TITLE = "Generador de Protocolos de Calidad"
 APP_VERSION = "1.0.0"
 
 
-SUMMARY_COLS = ["Cliente", "Comprobante", "Fecha", "M2", "Observaciones"]
+SUMMARY_COLS = ["Cliente", "Remito", "Fecha", "M2", "Observaciones"]
 SUMMARY_WIDTHS = [110, 160, 110, 90, 400]
 
 DETAIL_COLS = [
-    "Cliente", "Protocolo Serie LF", "Protocolo",
+    "Cliente", "LF - Producto", "Protocolo",
     "Ancho", "Largo", "M2", "Serie",
-    "Comprobante", "Descripción"
+    "Remito", "Producto"
 ]
 DETAIL_WIDTHS = [120, 200, 160, 60, 60, 60, 150, 120, 280]
 
@@ -269,7 +269,7 @@ class MainWindow(ctk.CTk):
 
         # Lista comprobantes
         self.list_comprobantes = MultiSelectListbox(
-            body, title="Comprobantes",
+            body, title="Remitos",
             on_select=self._on_comprobantes_changed,
             height=12, width=240,
         )
@@ -282,7 +282,7 @@ class MainWindow(ctk.CTk):
         right.grid_rowconfigure(1, weight=1)
         right.grid_rowconfigure(3, weight=2)
 
-        ctk.CTkLabel(right, text="Resumen por comprobante",
+        ctk.CTkLabel(right, text="Resumen por remito",
                      anchor="w", font=ctk.CTkFont(weight="bold")
                      ).grid(row=0, column=0, sticky="ew", padx=8, pady=(8, 2))
         self.tbl_summary = DataTable(right, columns=SUMMARY_COLS, widths=SUMMARY_WIDTHS, height=6)
@@ -476,14 +476,14 @@ class MainWindow(ctk.CTk):
 
         # Pre-análisis: comprobantes con items SAFED sin protocolo
         missing = data_service.analyze_missing_protocols(df_filtered)
-        log.info("→ missing: %d comprobante(s) con items sin protocolo", len(missing))
+        log.info("→ missing: %d remito(s) con items sin protocolo", len(missing))
         pre_results: list[ComprobanteResult] = []
 
         if missing:
             try:
                 detail_full = data_service.build_detail_view(df_filtered).copy()
                 problematicos = list(missing.keys())
-                export_df = detail_full[detail_full["Comprobante"].astype(str).isin(problematicos)].copy()
+                export_df = detail_full[detail_full["Remito"].astype(str).isin(problematicos)].copy()
                 if not export_df.empty:
                     mask_missing = export_df["Protocolo"].fillna("").astype(str).str.strip() == ""
                     # Solo las filas que realmente NO tienen protocolo.
@@ -503,6 +503,8 @@ class MainWindow(ctk.CTk):
                 return
             if decision == "skip":
                 problematicos = list(missing.keys())
+                # OJO: df_filtered es el DataFrame INTERNO (de fetch_data),
+                # tiene columna "#Comprobante", NO "Remito" (display name).
                 df_filtered = df_filtered[~df_filtered["#Comprobante"].astype(str).isin(problematicos)]
                 for comp, info in missing.items():
                     pre_results.append(ComprobanteResult(
@@ -513,7 +515,7 @@ class MainWindow(ctk.CTk):
                         mail=info["mail"],
                         estado="omitido_por_usuario",
                     ))
-                self._log_console(f"Omitidos por el usuario: {len(problematicos)} comprobante(s).")
+                self._log_console(f"Omitidos por el usuario: {len(problematicos)} remito(s).")
 
         log.info("→ Lanzando GenerationWorker (df=%d filas, pre_results=%d)",
                  len(df_filtered), len(pre_results))
@@ -539,7 +541,7 @@ class MainWindow(ctk.CTk):
     def _on_cancelar(self) -> None:
         if self.worker and self.worker.is_alive():
             self.cancel_event.set()
-            self._log_console("Cancelación solicitada... esperando a que termine el comprobante actual.")
+            self._log_console("Cancelación solicitada... esperando a que termine el remito actual.")
 
     def _on_open_output(self) -> None:
         if self.settings.storage_backend == "sharepoint":
@@ -581,6 +583,8 @@ class MainWindow(ctk.CTk):
         if self.df is None:
             return
         if selected:
+            # OJO: la columna en self.df es "#Comprobante" (nombre interno),
+            # NO "Remito" (que es solo el display name de la tabla).
             allowed = self.df[self.df["#Comprobante"].astype(str).isin(selected)]
             self.list_clientes.set_items_filtered(data_service.distinct_clientes(allowed))
         else:
@@ -615,7 +619,7 @@ class MainWindow(ctk.CTk):
         n_filas = len(df)
         n_safed = len(detail)
         self.lbl_summary_text.configure(
-            text=f"Comprobantes: {n_comp}  |  Filas: {n_filas}  |  Items SAFED: {n_safed}"
+            text=f"Remitos: {n_comp}  |  Filas: {n_filas}  |  Items SAFED: {n_safed}"
         )
 
     # ----------------------- Polling de eventos worker -----------------------
@@ -649,7 +653,7 @@ class MainWindow(ctk.CTk):
             n_cli = len(self.list_clientes._all_items)
             n_comp = len(self.list_comprobantes._all_items)
             self._log_console(
-                f"Datos cargados: {n_filas} filas, {n_cli} cliente(s), {n_comp} comprobante(s)."
+                f"Datos cargados: {n_filas} filas, {n_cli} cliente(s), {n_comp} remito(s)."
             )
             self.lbl_status.configure(text="Datos cargados.")
             self.btn_buscar.configure(state="normal")
@@ -712,7 +716,7 @@ class MainWindow(ctk.CTk):
         n = len(eligibles)
         n_generados = sum(1 for r in results if r.estado in ("ok", "solo_caratula"))
         done_msg = (
-            f"Protocolos generados: {n_generados} comprobante(s).\n"
+            f"Protocolos generados: {n_generados} remito(s).\n"
             f"Guardado en: {self._output_location_text()}"
         )
 
@@ -750,7 +754,7 @@ class MainWindow(ctk.CTk):
         skipped = [r for r in results if r.estado in ("ok", "solo_caratula") and not r.mail]
         if skipped:
             self._log_console(
-                f"{len(skipped)} comprobante(s) sin Mail Protocolos → no se abrió borrador."
+                f"{len(skipped)} remito(s) sin Mail Protocolos → no se abrió borrador."
             )
         self._log_console(f"Borradores abiertos: {ok}/{n}.")
 
