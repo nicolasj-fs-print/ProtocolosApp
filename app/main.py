@@ -20,11 +20,20 @@ from .config import get_settings
 from .utils.logger import new_run_id, setup_logger
 
 
-def main() -> int:
-    new_run_id()
-    settings = get_settings()
-    setup_logger(level=settings.log_level)
+def _run_auto(setup_auth: bool, dry_run: bool) -> int:
+    """Modo automático: cron diario sin GUI. Ver app/auto/runner.py."""
+    try:
+        from .auto.runner import run as auto_run
+        return auto_run(setup_auth=setup_auth, dry_run=dry_run)
+    except Exception:
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        return 1
 
+
+def _run_gui() -> int:
+    """Modo manual (interactivo): la GUI customtkinter de siempre."""
+    settings = get_settings()
     try:
         # Verificación de ODBC Driver 18 antes de cualquier ventana grande.
         # Si falta, ofrecemos instalarlo desde el .msi embebido.
@@ -61,6 +70,25 @@ def main() -> int:
         except Exception:
             print(tb, file=sys.stderr)
         return 1
+
+
+def main() -> int:
+    new_run_id()
+    settings = get_settings()
+    setup_logger(level=settings.log_level)
+
+    args = sys.argv[1:]
+    auto_mode = "--auto" in args
+    setup_auth = "--setup-auth" in args
+    dry_run = "--dry-run" in args
+
+    # --setup-auth implica modo auto (login interactivo único, sin GUI).
+    if setup_auth and not auto_mode:
+        auto_mode = True
+
+    if auto_mode:
+        return _run_auto(setup_auth=setup_auth, dry_run=dry_run)
+    return _run_gui()
 
 
 if __name__ == "__main__":

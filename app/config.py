@@ -55,6 +55,19 @@ class Settings:
     sp_ejecuciones_folder: str
     sp_usuarios_file: str
 
+    # Modo automático (cron diario, Iteración 7)
+    control_email: str
+    auto_days_back: int
+    sp_tracking_list_name: str
+    # Si está set, TODOS los mails del bot (cliente + control) van a esa
+    # dirección. Para PRODUCCIÓN: dejar VACÍO. Para PRUEBA: poner mi propio mail.
+    test_mode_override_email: str
+    # CC fijo para los mails que van al CLIENTE (no aplica al mail de control).
+    # Útil para que una persona reciba copia de cada protocolo enviado.
+    # Vacío = sin CC. Solo se respeta en producción (si test_mode_override_email
+    # está set, se ignora para no contaminar la prueba).
+    protocols_cc: str
+
     base_dir: Path = field(default_factory=project_root)
     runtime_dir: Path = field(default_factory=runtime_dir)
 
@@ -106,6 +119,11 @@ class Settings:
             sp_logs_folder=os.getenv("SP_LOGS_FOLDER", ""),
             sp_ejecuciones_folder=os.getenv("SP_EJECUCIONES_FOLDER", ""),
             sp_usuarios_file=os.getenv("SP_USUARIOS_FILE", ""),
+            control_email=os.getenv("CONTROL_EMAIL", ""),
+            auto_days_back=int(os.getenv("AUTO_DAYS_BACK", "7") or "7"),
+            sp_tracking_list_name=os.getenv("SP_TRACKING_LIST_NAME", "Tracking Envios"),
+            test_mode_override_email=os.getenv("TEST_MODE_OVERRIDE_EMAIL", ""),
+            protocols_cc=os.getenv("PROTOCOLS_CC", ""),
         )
 
     def odbc_connection_string(self, database: str | None = None) -> str:

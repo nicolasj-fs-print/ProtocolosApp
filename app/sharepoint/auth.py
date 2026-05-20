@@ -19,6 +19,12 @@ SCOPES = [
     "User.Read",
 ]
 
+# Scope adicional requerido por el modo automático (Graph Mail API).
+# NO se incluye en el SCOPES por defecto porque Mail.Send requiere "admin consent"
+# y rompería el login de la GUI para usuarios sin permisos de admin. El modo
+# `--auto` lo pide explícitamente vía `get_token(extra_scopes=[MAIL_SEND_SCOPE])`.
+MAIL_SEND_SCOPE = "Mail.Send"
+
 # Locks separados:
 # - _BUILD_LOCK: solo para inicializar _APP/_CACHE (corto, una vez por sesión).
 # - _CACHE_LOCK: solo para escribir el archivo de cache (corto).
@@ -85,19 +91,28 @@ def _persist_cache() -> None:
             log.warning("No se pudo guardar cache de token: %s", e)
 
 
-def get_token(interactive: bool = True) -> str:
+def get_token(interactive: bool = True, extra_scopes: list[str] | None = None) -> str:
     """Devuelve un access_token válido. Refresh silencioso, fallback interactive.
 
+    `extra_scopes` agrega permisos al set default (ej. `Mail.Send` para el modo auto).
+    Si esos scopes requieren admin consent y el usuario no es admin, el login va a
+    fallar — por eso solo se piden cuando realmente se necesitan.
+
     NO toma lock global durante la operación: MSAL.acquire_token_silent y
-    acquire_token_interactive son thread-safe internamente. Así múltiples
-    threads pueden pedir token concurrentemente sin colgarse uno al otro.
+    acquire_token_interactive son thread-safe internamente.
     """
+    scopes = list(SCOPES)
+    if extra_scopes:
+        for s in extra_scopes:
+            if s not in scopes:
+                scopes.append(s)
+
     app = _build_app()
     accounts = app.get_accounts()
     result: Optional[dict] = None
 
     if accounts:
-        result = app.acquire_token_silent(SCOPES, account=accounts[0])
+        result = app.acquire_token_silent(scopes, account=accounts[0])
 
     if not result:
         if not interactive:
@@ -105,7 +120,7 @@ def get_token(interactive: bool = True) -> str:
         log.info("Abriendo browser para login Microsoft...")
         try:
             result = app.acquire_token_interactive(
-                scopes=SCOPES,
+                scopes=scopes,
                 prompt="select_account",
             )
         except Exception as e:

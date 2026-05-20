@@ -854,6 +854,7 @@ class MainWindow(ctk.CTk):
 
         self._log_console(f"Abriendo {n} borrador(es) en Outlook...")
         ok = 0
+        resolved_manually: list[str] = []
         for r in eligibles:
             try:
                 # Outlook necesita un path LOCAL para adjuntar.
@@ -867,6 +868,7 @@ class MainWindow(ctk.CTk):
                     protocolos_no_encontrados=r.protocolos_no_encontrados,
                 )
                 ok += 1
+                resolved_manually.append(r.comprobante)
             except Exception as e:
                 log.exception("Error abriendo borrador Outlook para %s", r.comprobante)
                 self._log_console(f"⚠ No se pudo abrir Outlook para {r.comprobante}: {e}")
@@ -877,6 +879,50 @@ class MainWindow(ctk.CTk):
                 f"{len(skipped)} remito(s) sin Mail Protocolos → no se abrió borrador."
             )
         self._log_console(f"Borradores abiertos: {ok}/{n}.")
+
+        # Cerrar el ciclo "pending_control → resuelto_manual" en el tracking del bot.
+        # Best-effort en thread daemon: si falla (sin red, sin permisos), el ciclo
+        # manual sigue funcionando igual, solo queda el row del bot sin actualizar.
+        if resolved_manually and self.settings.storage_backend == "sharepoint":
+            threading.Thread(
+                target=self._mark_resolved_in_tracking,
+                args=(resolved_manually,),
+                daemon=True,
+            ).start()
+
+    def _mark_resolved_in_tracking(self, comprobantes: list[str]) -> None:
+        """Best-effort: marca cada comprobante como `resuelto_manual` en el tracking.
+
+        Solo se activa si el bot YA generó la SharePoint List (es decir, ya corrió
+        al menos una vez en modo automático). Si la list NO existe, este hook
+        no toca nada — la GUI manual no debe crear infraestructura del bot.
+        """
+        try:
+            from ..sharepoint.lists import (
+                ESTADO_PENDING_CONTROL,
+                ESTADO_RESUELTO_MANUAL,
+                get_lists,
+            )
+            lists = get_lists()
+            list_name = self.settings.sp_tracking_list_name
+            if not lists.list_exists(list_name):
+                # Bot nunca corrió → no hay nada que actualizar.
+                return
+            for comp in comprobantes:
+                try:
+                    existing = lists.find_by_comprobante(list_name, comp)
+                    if existing is None or existing.estado != ESTADO_PENDING_CONTROL:
+                        continue
+                    lists.upsert(
+                        list_name,
+                        comprobante=comp,
+                        estado=ESTADO_RESUELTO_MANUAL,
+                    )
+                    log.info("Tracking: %s → resuelto_manual", comp)
+                except Exception as e:
+                    log.warning("No se pudo marcar %s como resuelto_manual: %s", comp, e)
+        except Exception as e:
+            log.warning("Hook tracking resuelto_manual falló: %s", e)
 
     def _log_console(self, text: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
