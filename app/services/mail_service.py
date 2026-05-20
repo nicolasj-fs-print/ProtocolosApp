@@ -159,12 +159,17 @@ def _read_outlook_signature() -> str:
     return ""
 
 
-def _build_html_body(
+def build_html_body(
     razon_social: str,
     comprobante: str,
     encontrados: Sequence[str],
     no_encontrados: Sequence[str],
 ) -> str:
+    """Cuerpo HTML del mail que va al CLIENTE con los protocolos adjuntos.
+
+    Pure function — reusada tanto por la GUI manual (Outlook draft) como por el
+    modo automático (Graph Mail API).
+    """
     encontrados_html = "".join(f"<li>{p}</li>" for p in encontrados) or "<li>(sin protocolos)</li>"
     nf_block = ""
     if no_encontrados:
@@ -184,6 +189,56 @@ def _build_html_body(
         "<p>Quedamos a disposición ante cualquier consulta.</p>"
         "<p>Saludos cordiales.</p>"
     )
+
+
+def build_control_html_body(
+    comprobante: str,
+    cliente: str,
+    razon_social: str,
+    items_faltantes: Sequence[dict],
+) -> str:
+    """Cuerpo HTML para el aviso a CONTROL_EMAIL cuando un remito tiene items
+    SAFED sin protocolo.
+
+    `items_faltantes` viene de `data_service.analyze_missing_protocols` → cada
+    item es un dict con `producto`, `serie`, `m2`, `descripcion2`.
+    """
+    items_html = ""
+    for it in items_faltantes:
+        producto = it.get("producto", "") or "(sin producto)"
+        serie = it.get("serie", "") or "-"
+        m2 = it.get("m2", "") or "-"
+        desc = it.get("descripcion2", "") or ""
+        line = f"<li><b>{producto}</b> · Serie: {serie} · m²: {m2}"
+        if desc:
+            line += f"<br/><span style='color:#666'>{desc}</span>"
+        line += "</li>"
+        items_html += line
+
+    return (
+        "<p>Hola,</p>"
+        f"<p>El proceso automático detectó que el remito <b>{comprobante}</b> "
+        f"(cliente <b>{cliente} — {razon_social}</b>) tiene items SAFED "
+        "<b>sin protocolo asignado</b>.</p>"
+        "<p>El mail al cliente <b>NO</b> se envió. Para resolverlo:</p>"
+        "<ol>"
+        "<li>Asignar el protocolo correspondiente en el Excel "
+        "<b>Protocolos x Ingreso OK.xlsx</b>.</li>"
+        "<li>Abrir la aplicación <b>Generador de Protocolos de Calidad</b> "
+        "(modo manual).</li>"
+        "<li>Buscar el rango que incluye este remito, generar el PDF y enviar "
+        "el borrador desde Outlook.</li>"
+        "</ol>"
+        "<p><b>Items sin protocolo:</b></p>"
+        f"<ul>{items_html}</ul>"
+        "<p style='color:#666;font-size:11px'>"
+        "Este aviso fue generado automáticamente por el bot de Protocolos."
+        "</p>"
+    )
+
+
+# Alias retrocompatible.
+_build_html_body = build_html_body
 
 
 def open_outlook_draft(

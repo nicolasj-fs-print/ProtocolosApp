@@ -229,6 +229,83 @@ Fallback a `mailto:` si Outlook no responde (sin adjunto).
 
 ---
 
+## Modo automático (cron diario)
+
+A partir de Iteración 7, el mismo `.exe` admite un modo **automático** sin GUI, pensado para correr en un Windows Server vía Task Scheduler. Genera y envía los protocolos del día anterior sin intervención humana.
+
+### Diferencias con la GUI
+
+| | GUI manual | Modo `--auto` |
+|--|--|--|
+| Interfaz | customtkinter | Sin ventana (consola + log) |
+| Mail | Borrador en Outlook (Classic) | Enviado directo vía Graph Mail API |
+| Items sin protocolo | Dialog interactivo | Mail a `CONTROL_EMAIL` |
+| Tracking | No | SharePoint List (idempotente) |
+| Rango procesado | Lo elige el usuario | `today - AUTO_DAYS_BACK` → ayer |
+
+### Comportamiento
+
+Para cada remito del rango:
+- Si **todos** los items SAFED tienen protocolo → genera el PDF, lo sube a SP y manda el mail al cliente. Marca `enviado_cliente` en el tracking.
+- Si **falta al menos uno** → NO manda al cliente. Manda aviso a `CONTROL_EMAIL` con la lista de faltantes. Marca `pending_control`.
+- Si **falla** → log de error, no escribe tracking → reintenta al día siguiente.
+
+Cuando el operador resuelve un caso `pending_control` desde la GUI manual (genera PDF + abre borrador Outlook), la GUI marca automáticamente el tracking como `resuelto_manual`. El bot al día siguiente NO lo re-procesa.
+
+### Setup en el server
+
+1. **Buildear `.exe`** en tu maquina dev y copiarlo al server (ej. `C:\ProtocolosApp\`).
+2. **Completar `.env` del server** con las variables del modo auto:
+   ```
+   CONTROL_EMAIL=mail-de-control@fs-print.com
+   AUTO_DAYS_BACK=7
+   SP_TRACKING_LIST_NAME=Tracking Envios
+   ```
+3. **Login inicial** (una sola vez, con interacción humana):
+   ```powershell
+   C:\ProtocolosApp\ProtocolosApp.exe --setup-auth
+   ```
+   Abre browser, logueás con la cuenta del bot, aceptás permisos (incluye `Mail.Send`). Token cache queda en `%APPDATA%\ProtocolosApp\token.cache`.
+
+4. **Dry run** (opcional, no manda nada):
+   ```powershell
+   C:\ProtocolosApp\ProtocolosApp.exe --auto --dry-run
+   ```
+   Verifica que la auth, fetch SQL y tracking funcionen. Loguea qué mails se mandarían sin enviarlos.
+
+5. **Programar Task Scheduler**:
+   - **Action**: `C:\ProtocolosApp\ProtocolosApp.exe`
+   - **Arguments**: `--auto`
+   - **Trigger**: Daily, hora a elección (ej. 06:00).
+   - **Run whether user is logged on or not**: ✓ (con la cuenta del bot).
+   - **Settings**: "If task fails, restart every 10 min" / 3 intentos.
+
+### Exit codes
+- `0` — OK (procesó lo que correspondía, incluso si no había nada para procesar).
+- `1` — Error fatal. Revisar `%APPDATA%\ProtocolosApp\logs\run_*.log`.
+- `2` — Auth falló. Reloggear: `ProtocolosApp.exe --setup-auth`.
+
+### SharePoint List `Tracking Envios`
+
+El bot la crea sola la primera vez en el sitio configurado en `SP_APP_SITE`. Columnas:
+
+| Columna | Descripción |
+|--|--|
+| `Title` | `#Comprobante` (clave única) |
+| `Cliente` | Código de cliente |
+| `RazonSocial` | Razón social |
+| `FechaRemito` | Fecha del remito en SQL |
+| `FechaProcesado` | Datetime ISO de cuándo lo procesó el bot |
+| `Estado` | `enviado_cliente` / `pending_control` / `resuelto_manual` / `error` |
+| `MailDestino` | A quién se mandó |
+| `PdfUrl` | URL del PDF en SP |
+| `ItemsFaltantes` | JSON con los items SAFED sin protocolo (solo en `pending_control`) |
+| `RunId` | Timestamp de la corrida que escribió este row |
+
+Se puede consultar/editar a mano desde el browser para casos puntuales.
+
+---
+
 ## Troubleshooting
 
 - **"No se pudo establecer conexión a SQL"** al arrancar → verificar que tu IP esté autorizada en el servidor SQL y las credenciales en `.env`.
