@@ -5,6 +5,7 @@ __pycache__/
 *.pyo
 .env
 build/
+build_bot/
 dist/
 *.spec
 logs/
@@ -13,3 +14,7 @@ output/
 .vscode/
 *.log
 .claude/
+
+# Output de PyInstaller (onedir) — bundle pesado, no se versiona.
+ProtocolosApp/
+ProtocolosBot/
