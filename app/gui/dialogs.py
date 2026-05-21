@@ -295,12 +295,26 @@ class AlreadyGeneratedDialog(ctk.CTkToplevel):
 # AddClientesDialog — lista + filtro + multi-select para añadir clientes al flag S
 # =============================================================================
 class AddClientesDialog(ctk.CTkToplevel):
-    """Muestra una lista filtrable de clientes que NO tienen Protocolos='S'
-    y permite seleccionar varios para añadirlos."""
+    """Muestra una lista filtrable de clientes y permite seleccionar varios.
 
-    def __init__(self, parent, df_no_safed: "pd.DataFrame"):
+    Reusable para dos casos:
+      - "Añadir clientes" (default): se pasan clientes SIN flag 'S'.
+      - "Modificar clientes": se pasan clientes CON 'S' y `show_mail_in_label=True`
+        para mostrar el mail actual junto al nombre.
+    """
+
+    def __init__(
+        self,
+        parent,
+        df_clientes: "pd.DataFrame",
+        *,
+        window_title: str = "Añadir clientes",
+        header_text: str | None = None,
+        subtitle: str = "Buscá por nombre y marcá los que quieras añadir.",
+        show_mail_in_label: bool = False,
+    ):
         super().__init__(parent)
-        self.title("Añadir clientes")
+        self.title(window_title)
         self.geometry("640x560")
         self.minsize(520, 420)
 
@@ -308,9 +322,11 @@ class AddClientesDialog(ctk.CTkToplevel):
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
+        self._show_mail_in_label = show_mail_in_label
+
         # Estructura interna: lista de dicts con codigo, razon_social, mail_actual.
         self._all_items: list[dict] = []
-        for _, row in df_no_safed.iterrows():
+        for _, row in df_clientes.iterrows():
             cod = str(row.get("Código de cliente", "")).strip()
             razon = str(row.get("Razon Social", "")).strip()
             mail = str(row.get("Mail Protocolos", "")).strip()
@@ -334,16 +350,17 @@ class AddClientesDialog(ctk.CTkToplevel):
         self.grid_columnconfigure(0, weight=1)
 
         # Header
+        header_label = header_text or f"Clientes disponibles ({len(self._all_items)})"
         ctk.CTkLabel(
             self,
-            text=f"Clientes disponibles para añadir ({len(self._all_items)})",
+            text=header_label,
             font=ctk.CTkFont(size=14, weight="bold"),
             anchor="w",
         ).grid(row=0, column=0, sticky="ew", padx=16, pady=(14, 4))
 
         ctk.CTkLabel(
             self,
-            text="Buscá por nombre y marcá los que quieras añadir.",
+            text=subtitle,
             font=ctk.CTkFont(size=11),
             anchor="w",
         ).grid(row=0, column=0, sticky="ew", padx=16, pady=(0, 6))
@@ -405,15 +422,26 @@ class AddClientesDialog(ctk.CTkToplevel):
         q = (self._filter_var.get() or "").strip().lower()
         items = self._all_items
         if q:
-            items = [it for it in items if q in it["razon_social"].lower()]
+            if self._show_mail_in_label:
+                items = [
+                    it for it in items
+                    if q in it["razon_social"].lower()
+                    or q in (it.get("mail_actual") or "").lower()
+                ]
+            else:
+                items = [it for it in items if q in it["razon_social"].lower()]
 
         for i, it in enumerate(items):
             cod = it["codigo"]
             import tkinter as tk
             var = tk.BooleanVar(value=cod in self._selected_codes)
+            label = it["razon_social"]
+            if self._show_mail_in_label:
+                mail = it.get("mail_actual", "") or "(sin mail)"
+                label = f"{label}  —  {mail}"
             cb = ctk.CTkCheckBox(
                 self._body,
-                text=it["razon_social"],
+                text=label,
                 variable=var,
                 command=lambda c=cod, v=var: self._on_toggle(c, v),
                 font=ctk.CTkFont(size=12),
@@ -474,14 +502,27 @@ class AddClientesDialog(ctk.CTkToplevel):
 
 
 # =============================================================================
-# AskMailsDialog — pide mails para UN cliente (separados por ';')
+# AskMailsDialog — edita lista de mails de un cliente (checks + eliminar + agregar)
 # =============================================================================
 class AskMailsDialog(ctk.CTkToplevel):
+    """Dialog rediseñado para editar los mails de un cliente.
+
+    Layout:
+      - Header con razón social.
+      - Lista scrollable con un checkbox por mail actual (uno por fila).
+      - Botón rojo "Eliminar mails seleccionados" que quita los marcados.
+      - Entry de texto para añadir mails nuevos (separados por `;`).
+      - Footer: Saltar / Confirmar.
+
+    Al confirmar se devuelve la lista final como string separado por `;`
+    (lo que espera `update_clientes_in_excel`). Saltar deja el cliente igual.
+    """
+
     def __init__(self, parent, razon_social: str, mail_actual: str = ""):
         super().__init__(parent)
         self.title("Mails del cliente")
-        self.geometry("560x240")
-        self.resizable(False, False)
+        self.geometry("620x560")
+        self.minsize(520, 440)
 
         self.transient(parent)
         self.grab_set()
@@ -490,30 +531,59 @@ class AskMailsDialog(ctk.CTkToplevel):
         self.mails: str | None = None
         self.skipped: bool = False
 
-        self.grid_columnconfigure(0, weight=1)
+        # Estado interno: lista mutable de mails actuales (se reduce al eliminar).
+        self._mails_actuales: list[str] = self._parse_mails(mail_actual)
+        self._check_vars: dict[str, "tk.BooleanVar"] = {}
 
+        self.grid_columnconfigure(0, weight=1)
+        self.grid_rowconfigure(2, weight=1)  # frame de mails scrollable
+
+        # ----------- Header con razón social -----------
         ctk.CTkLabel(
             self, text=razon_social,
-            font=ctk.CTkFont(size=14, weight="bold"),
-            anchor="w", wraplength=500, justify="left",
-        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 4))
+            font=ctk.CTkFont(size=15, weight="bold"),
+            anchor="w", wraplength=560, justify="left",
+        ).grid(row=0, column=0, sticky="ew", padx=16, pady=(16, 6))
 
+        # ----------- Subtítulo "Mails actuales" -----------
+        self._lbl_mails_count = ctk.CTkLabel(
+            self, text="", anchor="w",
+            font=ctk.CTkFont(size=12, weight="bold"),
+        )
+        self._lbl_mails_count.grid(row=1, column=0, sticky="ew", padx=16, pady=(4, 2))
+
+        # ----------- Lista scrollable con checks por mail -----------
+        self._mails_frame = ctk.CTkScrollableFrame(self, height=180)
+        self._mails_frame.grid(row=2, column=0, sticky="nsew", padx=16, pady=(2, 8))
+        self._mails_frame.grid_columnconfigure(0, weight=1)
+
+        # ----------- Botón rojo: Eliminar mails seleccionados -----------
+        self._btn_eliminar = ctk.CTkButton(
+            self, text="Eliminar mails seleccionados",
+            fg_color="#dc2626", hover_color="#991b1b",
+            command=self._on_eliminar,
+        )
+        self._btn_eliminar.grid(row=3, column=0, sticky="ew", padx=16, pady=(0, 16))
+
+        # ----------- Label + Entry para añadir mails nuevos -----------
         ctk.CTkLabel(
             self,
-            text="Ingresá los mails (separados por  ;  para varios):",
+            text="Añadir mail (si son varios, separar con  ;  )",
             anchor="w",
-            font=ctk.CTkFont(size=12),
-        ).grid(row=1, column=0, sticky="ew", padx=16, pady=(6, 4))
+            font=ctk.CTkFont(size=12, weight="bold"),
+        ).grid(row=4, column=0, sticky="ew", padx=16, pady=(4, 2))
 
         import tkinter as tk
-        self._var = tk.StringVar(value=mail_actual or "")
+        self._new_mail_var = tk.StringVar(value="")
         ctk.CTkEntry(
-            self, textvariable=self._var,
+            self, textvariable=self._new_mail_var,
             font=ctk.CTkFont(size=13), height=36,
-        ).grid(row=2, column=0, sticky="ew", padx=16, pady=(0, 12))
+            placeholder_text="ej: nuevo@cliente.com  o  uno@x.com;dos@x.com",
+        ).grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 12))
 
+        # ----------- Footer: Saltar / Confirmar -----------
         footer = ctk.CTkFrame(self, fg_color="transparent")
-        footer.grid(row=3, column=0, sticky="ew", padx=12, pady=12)
+        footer.grid(row=6, column=0, sticky="ew", padx=12, pady=12)
         footer.grid_columnconfigure(0, weight=1)
 
         btns = ctk.CTkFrame(footer, fg_color="transparent")
@@ -531,7 +601,95 @@ class AskMailsDialog(ctk.CTkToplevel):
             fg_color="#1f6f3f", hover_color="#155226",
         ).grid(row=0, column=1, padx=4)
 
+        self._refresh_mails_list()
         self.after(50, self._center_on_parent)
+
+    # ----------- Helpers -----------
+
+    @staticmethod
+    def _parse_mails(s: str) -> list[str]:
+        """Split por ';' o ',' (compat). Strip + filtrar vacíos + dedupe preservando orden."""
+        if not s:
+            return []
+        raw = s.replace(",", ";").split(";")
+        seen: set[str] = set()
+        out: list[str] = []
+        for p in raw:
+            p = p.strip()
+            if p and p not in seen:
+                seen.add(p)
+                out.append(p)
+        return out
+
+    def _refresh_mails_list(self) -> None:
+        for w in self._mails_frame.winfo_children():
+            try:
+                w.destroy()
+            except Exception:
+                pass
+        self._check_vars.clear()
+
+        n = len(self._mails_actuales)
+        self._lbl_mails_count.configure(
+            text=f"Mails actuales ({n}):" if n else "Mails actuales (0):",
+        )
+
+        if not self._mails_actuales:
+            ctk.CTkLabel(
+                self._mails_frame,
+                text="(El cliente no tiene mails cargados — añadí abajo)",
+                anchor="w",
+                font=ctk.CTkFont(size=12, slant="italic"),
+                text_color="#888888",
+            ).grid(row=0, column=0, sticky="w", padx=8, pady=4)
+            self._btn_eliminar.configure(state="disabled")
+            return
+
+        self._btn_eliminar.configure(state="normal")
+        import tkinter as tk
+        for i, mail in enumerate(self._mails_actuales):
+            var = tk.BooleanVar(value=False)
+            cb = ctk.CTkCheckBox(
+                self._mails_frame,
+                text=mail,
+                variable=var,
+                font=ctk.CTkFont(size=12),
+            )
+            cb.grid(row=i, column=0, sticky="w", padx=8, pady=3)
+            self._check_vars[mail] = var
+
+    # ----------- Acciones -----------
+
+    def _on_eliminar(self) -> None:
+        to_remove = {m for m, v in self._check_vars.items() if v.get()}
+        if not to_remove:
+            messagebox.showinfo(
+                "Sin selección",
+                "Marcá los mails que querés eliminar.",
+                parent=self,
+            )
+            return
+        self._mails_actuales = [m for m in self._mails_actuales if m not in to_remove]
+        self._refresh_mails_list()
+
+    def _on_skip(self) -> None:
+        self.skipped = True
+        self.mails = None
+        self.destroy()
+
+    def _on_confirm(self) -> None:
+        nuevos = self._parse_mails(self._new_mail_var.get())
+        seen: set[str] = set()
+        final: list[str] = []
+        for m in self._mails_actuales + nuevos:
+            if m and m not in seen:
+                seen.add(m)
+                final.append(m)
+        self.skipped = False
+        self.mails = ";".join(final)
+        self.destroy()
+
+    # ----------- Misc -----------
 
     def _center_on_parent(self) -> None:
         try:
@@ -549,18 +707,7 @@ class AskMailsDialog(ctk.CTkToplevel):
         except Exception:
             pass
 
-    def _on_skip(self) -> None:
-        self.skipped = True
-        self.mails = None
-        self.destroy()
-
-    def _on_confirm(self) -> None:
-        val = (self._var.get() or "").strip()
-        self.skipped = False
-        self.mails = val
-        self.destroy()
-
     def show(self) -> tuple[bool, str | None]:
-        """Bloquea hasta cerrar. Devuelve (skipped, mails)."""
+        """Bloquea hasta cerrar. Devuelve (skipped, mails_separados_por_;)."""
         self.wait_window()
         return self.skipped, self.mails
