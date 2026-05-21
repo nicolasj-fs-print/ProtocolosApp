@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import tkinter as tk
 from tkinter import ttk
-from typing import Callable, Sequence
+from typing import Callable, Iterable, Sequence
 
 import customtkinter as ctk
 
@@ -105,6 +105,10 @@ class MultiSelectListbox(ctk.CTkFrame):
         self._all_items: list[str] = []
         self._visible_items: list[str] = []
         self._selected: set[str] = set()
+        # Items que se pintan en verde (ej. remitos ya procesados por el bot).
+        self._highlighted: set[str] = set()
+        self._highlight_bg = "#dcfce7"  # verde claro
+        self._highlight_fg = "#15803d"  # verde oscuro
         self._suppress_event = False
 
         self._lbl = ctk.CTkLabel(
@@ -160,7 +164,19 @@ class MultiSelectListbox(ctk.CTkFrame):
     def set_items(self, items: Sequence[str]) -> None:
         self._all_items = list(items)
         self._selected.clear()
+        # Nuevo "Buscar" → reset de highlights. El tracking se vuelve a cargar
+        # asincrónicamente y repinta lo que corresponda.
+        self._highlighted.clear()
         self._search_var.set("")
+        self._refresh_visible()
+
+    def set_highlighted(self, items: Iterable[str]) -> None:
+        """Marca los items recibidos en verde (ej. remitos ya procesados por el bot).
+
+        Items que no estén en `_all_items` se ignoran. No afecta la selección
+        ni el filtro de búsqueda. Llamar varias veces sobrescribe.
+        """
+        self._highlighted = {str(x) for x in items}
         self._refresh_visible()
 
     def set_items_filtered(self, items: Sequence[str]) -> None:
@@ -196,6 +212,15 @@ class MultiSelectListbox(ctk.CTkFrame):
         for i, it in enumerate(self._visible_items):
             if it in self._selected:
                 self._listbox.selection_set(i)
+            if it in self._highlighted:
+                # Pinta el item en verde (fondo claro + texto oscuro).
+                try:
+                    self._listbox.itemconfig(
+                        i, background=self._highlight_bg, foreground=self._highlight_fg,
+                        selectbackground="#86efac", selectforeground="#14532d",
+                    )
+                except tk.TclError:
+                    pass
         self._suppress_event = False
         self._lbl_count.configure(
             text=f"{len(self._selected)}/{len(self._all_items)} seleccionados"

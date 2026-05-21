@@ -149,7 +149,6 @@ class MainWindow(ctk.CTk):
             )
             self.btn_buscar.configure(state="disabled")
             self.btn_generar.configure(state="disabled")
-            self.btn_borrar.configure(state="disabled")
         except Exception as e:
             log.exception("Error inesperado en auth")
             messagebox.showerror("Error inesperado", str(e))
@@ -216,25 +215,25 @@ class MainWindow(ctk.CTk):
         self.btn_buscar = ctk.CTkButton(filters, text="Buscar", width=110, command=self._on_buscar)
         self.btn_buscar.grid(row=0, column=4, padx=(16, 4), pady=10)
 
-        self.btn_borrar = ctk.CTkButton(
-            filters, text="Borrar filtros", width=130,
-            command=self._on_borrar,
-            fg_color="#555555", hover_color="#3d3d3d",
-        )
-        self.btn_borrar.grid(row=0, column=5, padx=4, pady=10)
-
         self.btn_open_folder = ctk.CTkButton(
             filters, text="Abrir carpeta", width=120,
             command=self._on_open_output,
         )
-        self.btn_open_folder.grid(row=0, column=6, padx=4, pady=10)
+        self.btn_open_folder.grid(row=0, column=5, padx=4, pady=10)
 
         self.btn_add_clientes = ctk.CTkButton(
             filters, text="Añadir clientes", width=140,
             command=self._on_add_clientes,
             fg_color="#2c5282", hover_color="#1f3c66",
         )
-        self.btn_add_clientes.grid(row=0, column=7, padx=4, pady=10)
+        self.btn_add_clientes.grid(row=0, column=6, padx=4, pady=10)
+
+        self.btn_modify_clientes = ctk.CTkButton(
+            filters, text="Modificar clientes", width=150,
+            command=self._on_modify_clientes,
+            fg_color="#2c5282", hover_color="#1f3c66",
+        )
+        self.btn_modify_clientes.grid(row=0, column=7, padx=4, pady=10)
 
         # col 8 = spacer expansible (weight=1) → empuja "Generar" al borde derecho
 
@@ -422,7 +421,6 @@ class MainWindow(ctk.CTk):
         self.lbl_status.configure(text="Buscando datos...")
         self.btn_buscar.configure(state="disabled")
         self.btn_generar.configure(state="disabled")
-        self.btn_borrar.configure(state="disabled")
         self.update_idletasks()
 
         threading.Thread(
@@ -438,17 +436,46 @@ class MainWindow(ctk.CTk):
         except Exception as e:
             log.exception("Error en buscar worker")
             self.events.put(ProgressEvent("fetch_error", message=str(e)))
+            return
 
-    def _on_borrar(self) -> None:
-        self.df = None
-        self.list_clientes.set_items([])
-        self.list_comprobantes.set_items([])
-        self.tbl_summary.clear()
-        self.tbl_detail.clear()
-        self.lbl_summary_text.configure(text="Sin datos.")
-        self.btn_generar.configure(state="disabled")
-        self.progress.set(0)
-        self._log_console("Filtros y datos limpiados.")
+        # Después del fetch principal, levantamos en background los remitos ya
+        # registrados en la SP List del bot (para pintarlos en verde en la GUI).
+        # Si SP no responde o la list no existe, no rompe nada (best-effort).
+        threading.Thread(
+            target=self._load_tracking_async,
+            args=(d_from, d_to),
+            daemon=True,
+            name="GUI-LoadTracking",
+        ).start()
+
+    def _load_tracking_async(self, d_from, d_to) -> None:
+        """Consulta la SP List del bot y emite los #Comprobante con estado
+        terminal 'positivo' (enviado_cliente / enviado_manual / resuelto_manual).
+        Los pending_control y error NO se pintan."""
+        if self.settings.storage_backend != "sharepoint":
+            return
+        try:
+            from ..sharepoint.lists import (
+                ESTADO_ENVIADO_CLIENTE,
+                ESTADO_ENVIADO_MANUAL,
+                ESTADO_RESUELTO_MANUAL,
+                get_lists,
+            )
+            lists = get_lists()
+            list_name = self.settings.sp_tracking_list_name
+            if not lists.list_exists(list_name):
+                # Bot nunca corrió → no hay nada para pintar.
+                return
+            tracking = lists.fetch_in_range(list_name, d_from, d_to)
+            terminales_ok = {
+                ESTADO_ENVIADO_CLIENTE,
+                ESTADO_ENVIADO_MANUAL,
+                ESTADO_RESUELTO_MANUAL,
+            }
+            comps = {c for c, e in tracking.items() if e.estado in terminales_ok}
+            self.events.put(ProgressEvent("tracking_loaded", payload=comps))
+        except Exception as e:
+            log.warning("Tracking async load falló (no crítico): %s", e)
 
     def _on_add_clientes(self) -> None:
         """Flow para añadir clientes al listado (set Protocolos='S' + mails).
@@ -558,6 +585,120 @@ class MainWindow(ctk.CTk):
         self.btn_add_clientes.configure(state="normal")
         self.lbl_status.configure(text="Listo.")
 
+    def _on_modify_clientes(self) -> None:
+        """Flow para modificar mails de clientes que YA tienen Protocolos='S'.
+
+        Muestra clientes con S + sus mails actuales. Permite editar y guardar.
+        El flag 'S' se mantiene (no se quita). Si querés desactivar un cliente
+        del listado, hay que tocar el Excel a mano (decisión consciente para
+        evitar errores destructivos).
+        """
+        self.btn_modify_clientes.configure(state="disabled")
+        self.lbl_status.configure(text="Descargando lista de clientes...")
+        self._log_console("Descargando lista completa de clientes desde SharePoint...")
+        self.update_idletasks()
+
+        try:
+            df_all = data_service.load_clientes_all()
+        except Exception as e:
+            log.exception("Error al cargar clientes para modificar")
+            messagebox.showerror("Error", f"No se pudo cargar el listado de clientes:\n{e}")
+            self.btn_modify_clientes.configure(state="normal")
+            self.lbl_status.configure(text="Listo.")
+            return
+
+        if "Protocolos" not in df_all.columns:
+            messagebox.showerror(
+                "Excel inválido",
+                "No se encontró la columna 'Protocolos' en la hoja Clientes.",
+            )
+            self.btn_modify_clientes.configure(state="normal")
+            self.lbl_status.configure(text="Listo.")
+            return
+
+        mask_s = (
+            df_all["Protocolos"].fillna("").astype(str).str.strip().str.upper() == "S"
+        )
+        df_s = df_all[mask_s].copy()
+        if df_s.empty:
+            messagebox.showinfo(
+                "Sin clientes para modificar",
+                "No hay clientes con flag 'S' en el Excel. Usá 'Añadir clientes' primero.",
+            )
+            self.btn_modify_clientes.configure(state="normal")
+            self.lbl_status.configure(text="Listo.")
+            return
+
+        self.lbl_status.configure(text=f"{len(df_s)} cliente(s) con marca de protocolos.")
+        self.update_idletasks()
+
+        selected = AddClientesDialog(
+            self, df_s,
+            window_title="Modificar clientes",
+            header_text=f"Clientes con protocolos activos ({len(df_s)})",
+            subtitle="Buscá por nombre o mail, marcá los que quieras modificar.",
+            show_mail_in_label=True,
+        ).show()
+        if not selected:
+            self._log_console("Modificar clientes: cancelado.")
+            self.btn_modify_clientes.configure(state="normal")
+            self.lbl_status.configure(text="Listo.")
+            return
+
+        updates: dict[str, str] = {}
+        for cli in selected:
+            skipped, mails = AskMailsDialog(
+                self,
+                razon_social=cli["razon_social"],
+                mail_actual=cli["mail_actual"],
+            ).show()
+            if skipped:
+                self._log_console(f"  · {cli['razon_social']}: saltado.")
+                continue
+            updates[cli["codigo"]] = mails or ""
+
+        if not updates:
+            messagebox.showinfo("Sin cambios", "No se confirmó ningún cliente.")
+            self.btn_modify_clientes.configure(state="normal")
+            self.lbl_status.configure(text="Listo.")
+            return
+
+        self.lbl_status.configure(text=f"Guardando {len(updates)} cliente(s) en SharePoint...")
+        self._log_console(f"Modificando {len(updates)} cliente(s) en Stock Mendoza.xlsm...")
+        self.update_idletasks()
+
+        try:
+            n = data_service.update_clientes_in_excel(updates)
+        except Exception as e:
+            log.exception("Error al modificar clientes en Excel")
+            err_str = str(e)
+            if "resourceLocked" in err_str or " 423 " in err_str or err_str.startswith("chunk upload falló: 423"):
+                messagebox.showerror(
+                    "Excel bloqueado",
+                    "El archivo Stock Mendoza.xlsm está bloqueado en SharePoint.\n\n"
+                    "Causas más comunes:\n"
+                    "  • Lo tenés abierto en Excel (cerralo).\n"
+                    "  • Otra persona lo está editando online.\n"
+                    "  • OneDrive sigue sincronizando.\n\n"
+                    "Cerralo en Excel y volvé a intentar.",
+                )
+            else:
+                messagebox.showerror(
+                    "Error al guardar",
+                    f"No se pudieron guardar los cambios:\n{e}",
+                )
+            self.btn_modify_clientes.configure(state="normal")
+            self.lbl_status.configure(text="Listo.")
+            return
+
+        self._log_console(f"OK · {n} cliente(s) modificados.")
+        messagebox.showinfo(
+            "Clientes modificados",
+            f"{n} cliente(s) modificados.\n\nLos nuevos mails se usan a partir de la próxima ejecución.",
+        )
+        self.btn_modify_clientes.configure(state="normal")
+        self.lbl_status.configure(text="Listo.")
+
     def _on_generar(self) -> None:
         log.info("_on_generar invocado")
         if self.df is None or self.df.empty:
@@ -642,7 +783,6 @@ class MainWindow(ctk.CTk):
         self.cancel_event.clear()
         self.btn_generar.configure(state="disabled")
         self.btn_buscar.configure(state="disabled")
-        self.btn_borrar.configure(state="disabled")
         self.btn_cancelar.configure(state="normal")
         self.progress.set(0)
         self.lbl_status.configure(text="Generando...")
@@ -777,13 +917,21 @@ class MainWindow(ctk.CTk):
             )
             self.lbl_status.configure(text="Datos cargados.")
             self.btn_buscar.configure(state="normal")
-            self.btn_borrar.configure(state="normal")
             self.btn_generar.configure(state="normal" if n_filas > 0 else "disabled")
+        elif ev.kind == "tracking_loaded":
+            comps = ev.payload or set()
+            try:
+                self.list_comprobantes.set_highlighted(comps)
+            except Exception as e:
+                log.warning("set_highlighted falló: %s", e)
+            if comps:
+                self._log_console(
+                    f"Tracking: {len(comps)} remito(s) ya procesado(s) por el bot (resaltados en verde)."
+                )
         elif ev.kind == "fetch_error":
             self._log_console(f"✗ Error: {ev.message}")
             self.lbl_status.configure(text="Error.")
             self.btn_buscar.configure(state="normal")
-            self.btn_borrar.configure(state="normal")
             self.btn_generar.configure(state="disabled")
             messagebox.showerror("Error al buscar datos", ev.message)
         elif ev.kind == "done":
@@ -792,7 +940,6 @@ class MainWindow(ctk.CTk):
             self.lbl_status.configure(text="Listo.")
             self.btn_generar.configure(state="normal")
             self.btn_buscar.configure(state="normal")
-            self.btn_borrar.configure(state="normal")
             self.btn_cancelar.configure(state="disabled")
             self._maybe_open_drafts(ev.payload or [])
         elif ev.kind == "error":
@@ -800,7 +947,6 @@ class MainWindow(ctk.CTk):
             self.lbl_status.configure(text="Error.")
             self.btn_generar.configure(state="normal")
             self.btn_buscar.configure(state="normal")
-            self.btn_borrar.configure(state="normal")
             self.btn_cancelar.configure(state="disabled")
             messagebox.showerror("Error", ev.message)
 
@@ -854,7 +1000,7 @@ class MainWindow(ctk.CTk):
 
         self._log_console(f"Abriendo {n} borrador(es) en Outlook...")
         ok = 0
-        resolved_manually: list[str] = []
+        sent_manually: list[ComprobanteResult] = []
         for r in eligibles:
             try:
                 # Outlook necesita un path LOCAL para adjuntar.
@@ -868,7 +1014,7 @@ class MainWindow(ctk.CTk):
                     protocolos_no_encontrados=r.protocolos_no_encontrados,
                 )
                 ok += 1
-                resolved_manually.append(r.comprobante)
+                sent_manually.append(r)
             except Exception as e:
                 log.exception("Error abriendo borrador Outlook para %s", r.comprobante)
                 self._log_console(f"⚠ No se pudo abrir Outlook para {r.comprobante}: {e}")
@@ -880,25 +1026,35 @@ class MainWindow(ctk.CTk):
             )
         self._log_console(f"Borradores abiertos: {ok}/{n}.")
 
-        # Cerrar el ciclo "pending_control → resuelto_manual" en el tracking del bot.
+        # Registrar el envío manual en el tracking del bot.
         # Best-effort en thread daemon: si falla (sin red, sin permisos), el ciclo
         # manual sigue funcionando igual, solo queda el row del bot sin actualizar.
-        if resolved_manually and self.settings.storage_backend == "sharepoint":
+        # Asumimos que si el draft se abrió OK, el operador va a apretar Enviar.
+        if sent_manually and self.settings.storage_backend == "sharepoint":
             threading.Thread(
-                target=self._mark_resolved_in_tracking,
-                args=(resolved_manually,),
+                target=self._register_manual_sends,
+                args=(sent_manually,),
                 daemon=True,
             ).start()
 
-    def _mark_resolved_in_tracking(self, comprobantes: list[str]) -> None:
-        """Best-effort: marca cada comprobante como `resuelto_manual` en el tracking.
+    def _register_manual_sends(self, results: list[ComprobanteResult]) -> None:
+        """Best-effort: registra cada envío manual en el tracking del bot.
 
-        Solo se activa si el bot YA generó la SharePoint List (es decir, ya corrió
-        al menos una vez en modo automático). Si la list NO existe, este hook
-        no toca nada — la GUI manual no debe crear infraestructura del bot.
+        Lógica por remito:
+          - Si NO está en tracking → CREA fila con estado `enviado_manual`.
+          - Si está como `pending_control` (el bot lo flagueó) → pasa a `resuelto_manual`.
+          - Si está en otro estado terminal (enviado_cliente, enviado_manual,
+            resuelto_manual) → no toca (ya estaba cerrado).
+          - Si está como `error` → lo pisa con `enviado_manual` (consideramos que
+            el operador resolvió lo que el bot no pudo).
+
+        Solo se activa si la SharePoint List existe (no la crea desde la GUI).
         """
         try:
             from ..sharepoint.lists import (
+                ESTADO_ENVIADO_CLIENTE,
+                ESTADO_ENVIADO_MANUAL,
+                ESTADO_ERROR,
                 ESTADO_PENDING_CONTROL,
                 ESTADO_RESUELTO_MANUAL,
                 get_lists,
@@ -906,23 +1062,87 @@ class MainWindow(ctk.CTk):
             lists = get_lists()
             list_name = self.settings.sp_tracking_list_name
             if not lists.list_exists(list_name):
-                # Bot nunca corrió → no hay nada que actualizar.
+                # Bot nunca corrió → no hay tracking todavía. NO la creamos desde
+                # la GUI (esa es responsabilidad del modo --auto).
                 return
-            for comp in comprobantes:
+
+            terminales_cerrados = {
+                ESTADO_ENVIADO_CLIENTE,
+                ESTADO_ENVIADO_MANUAL,
+                ESTADO_RESUELTO_MANUAL,
+            }
+
+            from datetime import datetime
+            run_id = "gui-" + datetime.now().strftime("%Y%m%d_%H%M%S")
+            for r in results:
                 try:
+                    comp = r.comprobante
                     existing = lists.find_by_comprobante(list_name, comp)
-                    if existing is None or existing.estado != ESTADO_PENDING_CONTROL:
+
+                    if existing is None:
+                        # Nunca tocado por el bot → crear como envío manual.
+                        try:
+                            fecha_str = ""
+                            if self.df is not None and not self.df.empty:
+                                sub = self.df[self.df["#Comprobante"].astype(str) == comp]
+                                if not sub.empty:
+                                    f = sub.iloc[0].get("Fecha")
+                                    try:
+                                        fecha_str = pd.to_datetime(f).date().isoformat()
+                                    except Exception:
+                                        pass
+                        except Exception:
+                            fecha_str = ""
+
+                        lists.upsert(
+                            list_name,
+                            comprobante=comp,
+                            cliente=r.cliente,
+                            razon_social=r.razon_social,
+                            fecha_remito=fecha_str,
+                            estado=ESTADO_ENVIADO_MANUAL,
+                            mail_destino=r.mail or "(desde GUI)",
+                            pdf_url=r.pdf_path or "",
+                            run_id=run_id,
+                        )
+                        log.info("Tracking: %s → enviado_manual (nuevo, desde GUI)", comp)
                         continue
-                    lists.upsert(
-                        list_name,
-                        comprobante=comp,
-                        estado=ESTADO_RESUELTO_MANUAL,
+
+                    if existing.estado in terminales_cerrados:
+                        # Ya estaba cerrado → no tocar.
+                        continue
+
+                    if existing.estado == ESTADO_PENDING_CONTROL:
+                        lists.upsert(
+                            list_name,
+                            comprobante=comp,
+                            estado=ESTADO_RESUELTO_MANUAL,
+                        )
+                        log.info("Tracking: %s → resuelto_manual", comp)
+                        continue
+
+                    if existing.estado == ESTADO_ERROR:
+                        # El bot había fallado; el operador lo resolvió.
+                        lists.upsert(
+                            list_name,
+                            comprobante=comp,
+                            estado=ESTADO_ENVIADO_MANUAL,
+                            mail_destino=r.mail or "(desde GUI)",
+                            pdf_url=r.pdf_path or "",
+                            run_id=run_id,
+                        )
+                        log.info("Tracking: %s (estaba en error) → enviado_manual", comp)
+                        continue
+
+                    # Cualquier otro estado desconocido → log warning, no tocar.
+                    log.warning(
+                        "Tracking: %s tiene estado desconocido '%s', no se modifica",
+                        comp, existing.estado,
                     )
-                    log.info("Tracking: %s → resuelto_manual", comp)
                 except Exception as e:
-                    log.warning("No se pudo marcar %s como resuelto_manual: %s", comp, e)
+                    log.warning("No se pudo registrar %s en tracking: %s", comp, e)
         except Exception as e:
-            log.warning("Hook tracking resuelto_manual falló: %s", e)
+            log.warning("Hook _register_manual_sends falló: %s", e)
 
     def _log_console(self, text: str) -> None:
         ts = datetime.now().strftime("%H:%M:%S")
