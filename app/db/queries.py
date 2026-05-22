@@ -75,7 +75,7 @@ def build_detalle_query(
 # ---------------------------------------------------------------------------
 # Trazabilidad de papel (DB FSBI)
 # ---------------------------------------------------------------------------
-TRAZABILIDAD_FORMULARIO_CODES = ("IR", "IRF", "LF")
+TRAZABILIDAD_FORMULARIO_CODES = ("IR", "IRP", "LF")
 
 
 def build_trazabilidad_query(n_series: int) -> str:

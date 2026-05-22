@@ -424,6 +424,8 @@ def fetch_data(
     date_to: date,
     codigo_cliente: str | None = None,
     nrofor: str | None = None,
+    *,
+    prioritize_lf: bool = False,
 ) -> pd.DataFrame:
     """Trae el detalle completo y devuelve un DataFrame con TODAS las columnas
     necesarias para tabla 1 (resumen) y tabla 2 (detalle SAFED).
@@ -431,6 +433,10 @@ def fetch_data(
     El filtrado fino por cliente / comprobante de la GUI se hace en pandas
     (cross-filter), por lo que `codigo_cliente`/`nrofor` aquí se usan solo
     para acotar la consulta cuando el usuario escribe valores explícitos.
+
+    `prioritize_lf=True` (usado por la GUI): en el lookup de Trazabilidad
+    descarta los IR y prioriza LF > IRF. Default False mantiene el
+    comportamiento original (usado por el bot por compatibilidad).
     """
     validate_date_range(date_from, date_to)
 
@@ -474,7 +480,7 @@ def fetch_data(
 
     enriched = _ensure_required_cols(enriched)
 
-    enriched = enrich_with_protocolos(enriched)
+    enriched = enrich_with_protocolos(enriched, prioritize_lf=prioritize_lf)
 
     validate_dataframe_columns(enriched)
 
@@ -486,12 +492,19 @@ def fetch_data(
 # ---------------------------------------------------------------------------
 # Enriquecimiento: Protocolo + Protocolo Serie LF (Iteración 2)
 # ---------------------------------------------------------------------------
-def enrich_with_protocolos(df: pd.DataFrame) -> pd.DataFrame:
+def enrich_with_protocolos(
+    df: pd.DataFrame,
+    *,
+    prioritize_lf: bool = False,
+) -> pd.DataFrame:
     """Llena Protocolo, Protocolo Serie LF y #Protocolo PDF cruzando con
     FSBI.dbo.TrazabilidadPapel + Excel `Protocolos x Ingreso OK.xlsx`.
 
     Aplica solo a items con TipoProducto == 'SAFED'. Cualquier item sin
     match queda con valores vacíos (NO bloqueante).
+
+    `prioritize_lf` se pasa al lookup de trazabilidad (ver docstring de
+    `lookup_trazabilidad`).
     """
     if df.empty:
         return df
@@ -510,7 +523,7 @@ def enrich_with_protocolos(df: pd.DataFrame) -> pd.DataFrame:
 
     # 1) Trazabilidad
     try:
-        traza = lookup_trazabilidad(serie_keys)
+        traza = lookup_trazabilidad(serie_keys, prioritize_lf=prioritize_lf)
     except Exception as e:
         log.exception("Error en lookup trazabilidad: %s", e)
         traza = pd.DataFrame(columns=["Serie", "FormularioCodigo", "FormularioNumero", "ProductoTraza"])
