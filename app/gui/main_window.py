@@ -431,7 +431,9 @@ class MainWindow(ctk.CTk):
 
     def _buscar_worker(self, d_from, d_to) -> None:
         try:
-            df = data_service.fetch_data(d_from, d_to)
+            # GUI: prioriza LF > IRF y descarta IR en el lookup de trazabilidad.
+            # El bot por ahora sigue con el comportamiento original (sin prioridad).
+            df = data_service.fetch_data(d_from, d_to, prioritize_lf=True)
             self.events.put(ProgressEvent("fetch_done", payload=df))
         except Exception as e:
             log.exception("Error en buscar worker")

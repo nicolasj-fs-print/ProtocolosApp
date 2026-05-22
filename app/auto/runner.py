@@ -367,7 +367,9 @@ def run(setup_auth: bool = False, dry_run: bool = False) -> int:
 
     # --- Fetch SQL ---
     try:
-        df = data_service.fetch_data(date_from, date_to)
+        # Misma política que la GUI: prioriza LF > IRP y descarta IR
+        # en el lookup de trazabilidad.
+        df = data_service.fetch_data(date_from, date_to, prioritize_lf=True)
     except Exception as e:
         log.exception("fetch_data falló: %s", e)
         return EXIT_FATAL
