@@ -1,4 +1,4 @@
-"""Entrypoint dedicado del bot (modo automático).
+"""Entrypoint dedicado del bot de protocolos (cron diario, sin GUI).
 
 Hardcodea el flag `--auto`. Doble click sobre el .exe resultante (o Task
 Scheduler) → corre el modo automático sin GUI.

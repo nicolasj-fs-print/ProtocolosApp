@@ -31,6 +31,17 @@ def _run_auto(setup_auth: bool, dry_run: bool) -> int:
         return 1
 
 
+def _run_mailbot(setup_auth: bool, dry_run: bool) -> int:
+    """MailBot Fedrigoni: cron cada 10 min sin GUI. Ver app/auto/mailbot.py."""
+    try:
+        from .auto.mailbot import run as mailbot_run
+        return mailbot_run(setup_auth=setup_auth, dry_run=dry_run)
+    except Exception:
+        tb = traceback.format_exc()
+        print(tb, file=sys.stderr)
+        return 1
+
+
 def _run_gui() -> int:
     """Modo manual (interactivo): la GUI customtkinter de siempre."""
     settings = get_settings()
@@ -79,8 +90,13 @@ def main() -> int:
 
     args = sys.argv[1:]
     auto_mode = "--auto" in args
+    mailbot_mode = "--mailbot" in args
     setup_auth = "--setup-auth" in args
     dry_run = "--dry-run" in args
+
+    # MailBot tiene prioridad sobre --auto si vinieran ambos por error.
+    if mailbot_mode:
+        return _run_mailbot(setup_auth=setup_auth, dry_run=dry_run)
 
     # --setup-auth implica modo auto (login interactivo único, sin GUI).
     if setup_auth and not auto_mode:

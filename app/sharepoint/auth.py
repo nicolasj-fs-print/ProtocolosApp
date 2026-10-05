@@ -1,4 +1,10 @@
-"""Auth contra Microsoft Graph (MSAL public client + token cache)."""
+"""Auth contra Microsoft Graph (MSAL public client + token cache).
+
+Soporta múltiples token caches (uno por cuenta) para que el bot principal
+(--auto) y el mailbot (--mailbot, logueado con AGENTE) NO se pisen entre sí.
+Cada cache vive en %APPDATA%\\ProtocolosApp\\token_{name}.cache (o token.cache
+para el default).
+"""
 from __future__ import annotations
 
 import os
@@ -19,45 +25,43 @@ SCOPES = [
     "User.Read",
 ]
 
-# Scope adicional requerido por el modo automático (Graph Mail API).
-# NO se incluye en el SCOPES por defecto porque Mail.Send requiere "admin consent"
-# y rompería el login de la GUI para usuarios sin permisos de admin. El modo
-# `--auto` lo pide explícitamente vía `get_token(extra_scopes=[MAIL_SEND_SCOPE])`.
+# Scopes adicionales que se piden ON-DEMAND cuando un flujo los necesita.
+# Mantener fuera del SCOPES default evita pedir admin consent en flujos que
+# no los necesitan (ej. la GUI manual).
 MAIL_SEND_SCOPE = "Mail.Send"
+MAIL_READWRITE_SCOPE = "Mail.ReadWrite"
 
-# Locks separados:
-# - _BUILD_LOCK: solo para inicializar _APP/_CACHE (corto, una vez por sesión).
-# - _CACHE_LOCK: solo para escribir el archivo de cache (corto).
-# MSAL.PublicClientApplication.acquire_token_* es thread-safe internamente,
-# así que NO necesitamos un lock global durante toda la operación de get_token.
+# Estado por nombre de cache. Default `"default"` es la cuenta del bot/usuario.
+# El mailbot usa `"agente"` para no pisar tokens entre cuentas distintas.
 _BUILD_LOCK = threading.Lock()
 _CACHE_LOCK = threading.Lock()
-_APP: msal.PublicClientApplication | None = None
-_CACHE: msal.SerializableTokenCache | None = None
+_APPS: dict[str, msal.PublicClientApplication] = {}
+_CACHES: dict[str, msal.SerializableTokenCache] = {}
 
 
 class AuthError(RuntimeError):
     pass
 
 
-def _cache_path() -> Path:
+def _cache_path(cache_name: str = "default") -> Path:
     base = os.getenv("APPDATA") or str(Path.home())
     p = Path(base) / "ProtocolosApp"
     p.mkdir(parents=True, exist_ok=True)
-    return p / "token.cache"
+    fname = "token.cache" if cache_name == "default" else f"token_{cache_name}.cache"
+    return p / fname
 
 
-def _build_app() -> msal.PublicClientApplication:
-    """Inicialización lazy del MSAL app + cache. Thread-safe vía _BUILD_LOCK
-    (solo para la primera construcción)."""
-    global _APP, _CACHE
-    # Double-check: si ya está, sin lock.
-    if _APP is not None:
-        return _APP
+def _build_app(cache_name: str = "default") -> msal.PublicClientApplication:
+    """Inicialización lazy del MSAL app + cache para el `cache_name` pedido."""
+    # Double-check sin lock si ya está construido.
+    app = _APPS.get(cache_name)
+    if app is not None:
+        return app
 
     with _BUILD_LOCK:
-        if _APP is not None:
-            return _APP
+        app = _APPS.get(cache_name)
+        if app is not None:
+            return app
 
         s = get_settings()
         if not s.ms_tenant_id or not s.ms_client_id:
@@ -65,38 +69,48 @@ def _build_app() -> msal.PublicClientApplication:
                 "Faltan MS_TENANT_ID y/o MS_CLIENT_ID en .env (o no se cargó el .env)."
             )
 
-        _CACHE = msal.SerializableTokenCache()
-        cache_file = _cache_path()
+        cache = msal.SerializableTokenCache()
+        cache_file = _cache_path(cache_name)
         if cache_file.exists():
             try:
-                _CACHE.deserialize(cache_file.read_text(encoding="utf-8"))
+                cache.deserialize(cache_file.read_text(encoding="utf-8"))
             except Exception as e:
-                log.warning("Cache de token inválido, se ignora: %s", e)
+                log.warning("Cache de token inválido (%s), se ignora: %s", cache_name, e)
 
-        _APP = msal.PublicClientApplication(
+        app = msal.PublicClientApplication(
             client_id=s.ms_client_id,
             authority=f"https://login.microsoftonline.com/{s.ms_tenant_id}",
-            token_cache=_CACHE,
+            token_cache=cache,
         )
-        return _APP
+        _APPS[cache_name] = app
+        _CACHES[cache_name] = cache
+        return app
 
 
-def _persist_cache() -> None:
-    if _CACHE is None or not _CACHE.has_state_changed:
+def _persist_cache(cache_name: str = "default") -> None:
+    cache = _CACHES.get(cache_name)
+    if cache is None or not cache.has_state_changed:
         return
     with _CACHE_LOCK:
         try:
-            _cache_path().write_text(_CACHE.serialize(), encoding="utf-8")
+            _cache_path(cache_name).write_text(cache.serialize(), encoding="utf-8")
         except OSError as e:
-            log.warning("No se pudo guardar cache de token: %s", e)
+            log.warning("No se pudo guardar cache de token (%s): %s", cache_name, e)
 
 
-def get_token(interactive: bool = True, extra_scopes: list[str] | None = None) -> str:
+def get_token(
+    interactive: bool = True,
+    extra_scopes: list[str] | None = None,
+    cache_name: str = "default",
+) -> str:
     """Devuelve un access_token válido. Refresh silencioso, fallback interactive.
 
     `extra_scopes` agrega permisos al set default (ej. `Mail.Send` para el modo auto).
     Si esos scopes requieren admin consent y el usuario no es admin, el login va a
     fallar — por eso solo se piden cuando realmente se necesitan.
+
+    `cache_name` selecciona qué token cache usar. Por defecto `"default"` (la
+    cuenta del bot/usuario). El mailbot pasa `"agente"` para no pisar tokens.
 
     NO toma lock global durante la operación: MSAL.acquire_token_silent y
     acquire_token_interactive son thread-safe internamente.
@@ -107,7 +121,7 @@ def get_token(interactive: bool = True, extra_scopes: list[str] | None = None) -
             if s not in scopes:
                 scopes.append(s)
 
-    app = _build_app()
+    app = _build_app(cache_name)
     accounts = app.get_accounts()
     result: Optional[dict] = None
 
@@ -116,8 +130,10 @@ def get_token(interactive: bool = True, extra_scopes: list[str] | None = None) -
 
     if not result:
         if not interactive:
-            raise AuthError("No hay sesión cacheada (interactive=False).")
-        log.info("Abriendo browser para login Microsoft...")
+            raise AuthError(
+                f"No hay sesión cacheada para '{cache_name}' (interactive=False)."
+            )
+        log.info("Abriendo browser para login Microsoft (cache=%s)...", cache_name)
         try:
             result = app.acquire_token_interactive(
                 scopes=scopes,
@@ -130,23 +146,25 @@ def get_token(interactive: bool = True, extra_scopes: list[str] | None = None) -
         err = (result or {}).get("error_description") or (result or {}).get("error") or "desconocido"
         raise AuthError(f"No se pudo obtener token: {err}")
 
-    _persist_cache()
+    _persist_cache(cache_name)
     return result["access_token"]
 
 
-def ensure_authenticated() -> str:
+def ensure_authenticated(
+    extra_scopes: list[str] | None = None,
+    cache_name: str = "default",
+) -> str:
     """Garantiza que haya un token válido (puede abrir browser la primera vez)."""
-    return get_token(interactive=True)
+    return get_token(interactive=True, extra_scopes=extra_scopes, cache_name=cache_name)
 
 
-def sign_out() -> None:
+def sign_out(cache_name: str = "default") -> None:
     """Borra cache de token (próxima llamada a get_token vuelve a pedir login)."""
     with _BUILD_LOCK:
-        global _APP, _CACHE
         try:
-            _cache_path().unlink(missing_ok=True)
+            _cache_path(cache_name).unlink(missing_ok=True)
         except OSError:
             pass
-        _APP = None
-        _CACHE = None
-        log.info("Sesión cerrada (cache de token eliminado).")
+        _APPS.pop(cache_name, None)
+        _CACHES.pop(cache_name, None)
+        log.info("Sesión cerrada (cache='%s' eliminado).", cache_name)
