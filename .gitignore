@@ -19,3 +19,8 @@ output/
 # Output de PyInstaller (onedir) — bundle pesado, no se versiona.
 ProtocolosApp/
 ProtocolosBot/
+
+# Scripts de debug, backups y PDFs de prueba locales (modo test del MailBot).
+_debug*.py
+* - copia*
+test_pdfs/
