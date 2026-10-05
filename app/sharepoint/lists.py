@@ -260,6 +260,136 @@ class SharePointLists:
                 return self._fields_to_entry(it.get("id", ""), fields)
         return None
 
+    # ----------- Espejo en app_2_db -----------
+
+    def _espejo_app2(
+        self,
+        comprobante: str,
+        cliente: str,
+        razon_social: str,
+        fecha_remito: str,
+        estado: str,
+        mail_destino: str,
+        pdf_url: str,
+        items_faltantes: str,
+        run_id: str,
+    ) -> None:
+        """Copia el tracking a app_2_db, la base de la app de Seguimiento de Órdenes.
+
+        Se llama DESPUÉS de que la escritura a SharePoint salió bien, y NUNCA tira: si el
+        VPS está caído el bot tiene que seguir mandando los mails igual. Antes de esto el
+        bot no dependía de esa app y no puede empezar a depender ahora.
+
+        SharePoint sigue siendo la fuente de la que el bot LEE para saber qué ya procesó
+        (`fetch_in_range`). Esto es, por ahora, solo un espejo.
+
+        ⚠️ El usuario `agente_dsk` SOLO puede tocar la tabla `protocolos_envios`: no puede
+        leer ninguna otra de la app, ni borrar. Verificado conectándose con él. No usar acá
+        `app_2_user`, que es dueño de las 55 tablas.
+
+        Config (si falta cualquiera, no hace nada y no molesta):
+            APP2_PG_HOST      10.250.2.5
+            APP2_PG_PORT      5432
+            APP2_PG_DB        app_2_db
+            APP2_PG_USER      agente_dsk
+            APP2_PG_PASSWORD  la que genero server/db/preparar-usuario-protocolos.mjs
+        """
+        import os
+
+        cfg = {
+            "host": os.getenv("APP2_PG_HOST"),
+            "port": os.getenv("APP2_PG_PORT", "5432"),
+            "dbname": os.getenv("APP2_PG_DB", "app_2_db"),
+            "user": os.getenv("APP2_PG_USER"),
+            "password": os.getenv("APP2_PG_PASSWORD"),
+        }
+        if not cfg["host"] or not cfg["user"] or not cfg["password"]:
+            return
+
+        # Los vacíos van como NULL para que el COALESCE de abajo conserve lo que ya había.
+        def v(x):
+            x = (x or "").strip()
+            return x or None
+
+        faltantes = self._faltantes_a_json(items_faltantes)
+
+        try:
+            import psycopg2
+
+            conn = psycopg2.connect(
+                host=cfg["host"],
+                port=int(cfg["port"]),
+                dbname=cfg["dbname"],
+                user=cfg["user"],
+                password=cfg["password"],
+                # Sin timeout, un server que acepta la conexión y no contesta cuelga el bot.
+                connect_timeout=8,
+                # El tráfico cruza la LAN: se cifra. `require` no valida el certificado,
+                # que es lo correcto acá porque el cert es para apps.fs-print.com y nos
+                # conectamos por IP.
+                sslmode="require",
+                application_name="ProtocolosBot",
+            )
+            try:
+                with conn:
+                    with conn.cursor() as cur:
+                        # El COALESCE replica la misma regla que este upsert usa contra
+                        # SharePoint: los campos que vienen vacíos NO pisan lo que ya
+                        # estaba. Sin eso, el segundo escribe de un remito (cuando pasa de
+                        # pending_control a resuelto_manual, que manda solo el estado)
+                        # borraría cliente, razón social, fecha e items_faltantes.
+                        #
+                        # `estado` y `fecha_procesado` se actualizan SIEMPRE, igual que allá.
+                        cur.execute(
+                            """
+                            insert into public.protocolos_envios
+                                (comprobante, cliente, razon_social, fecha_remito,
+                                 fecha_procesado, estado, mail_destino, pdf_url,
+                                 items_faltantes, run_id, origen, updated_at)
+                            values (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s, 'bot', now())
+                            on conflict (comprobante) do update set
+                                cliente         = coalesce(excluded.cliente,         protocolos_envios.cliente),
+                                razon_social    = coalesce(excluded.razon_social,    protocolos_envios.razon_social),
+                                fecha_remito    = coalesce(excluded.fecha_remito,    protocolos_envios.fecha_remito),
+                                mail_destino    = coalesce(excluded.mail_destino,    protocolos_envios.mail_destino),
+                                pdf_url         = coalesce(excluded.pdf_url,         protocolos_envios.pdf_url),
+                                items_faltantes = coalesce(excluded.items_faltantes, protocolos_envios.items_faltantes),
+                                run_id          = coalesce(excluded.run_id,          protocolos_envios.run_id),
+                                estado          = excluded.estado,
+                                fecha_procesado = excluded.fecha_procesado,
+                                origen          = 'bot',
+                                updated_at      = now()
+                            """,
+                            (
+                                comprobante, v(cliente), v(razon_social), v(fecha_remito),
+                                datetime.now().isoformat(timespec="seconds"), v(estado),
+                                v(mail_destino), v(pdf_url), faltantes, v(run_id),
+                            ),
+                        )
+                log.info("Espejo app_2_db OK: %s", comprobante)
+            finally:
+                conn.close()
+        except Exception as e:
+            log.warning("Espejo app_2_db falló para %s (no es fatal): %s", comprobante, e)
+
+    @staticmethod
+    def _faltantes_a_json(valor: str) -> str | None:
+        """`items_faltantes` a algo que entre en una columna jsonb, o None.
+
+        El bot lo manda como JSON serializado, pero en algún caso puede ser texto suelto.
+        Si no parsea, se envuelve en vez de perderlo (y de romper el insert entero).
+        """
+        import json
+
+        s = (valor or "").strip()
+        if not s:
+            return None
+        try:
+            json.loads(s)
+            return s
+        except (ValueError, TypeError):
+            return json.dumps({"texto": s})
+
     # ----------- Upsert -----------
 
     def upsert(
@@ -313,6 +443,8 @@ class SharePointLists:
                     f"upsert PATCH falló: {resp.status_code} {resp.text}"
                 )
             log.info("Tracking UPDATED: %s → %s", comprobante, estado or "(sin estado)")
+            self._espejo_app2(comprobante, cliente, razon_social, fecha_remito,
+                              estado, mail_destino, pdf_url, items_faltantes, run_id)
             return self._fields_to_entry(existing.item_id, resp.json())
 
         # POST nuevo.
@@ -325,6 +457,8 @@ class SharePointLists:
         item = resp.json()
         item_id = item.get("id", "")
         log.info("Tracking CREATED: %s → %s", comprobante, estado or "(sin estado)")
+        self._espejo_app2(comprobante, cliente, razon_social, fecha_remito,
+                          estado, mail_destino, pdf_url, items_faltantes, run_id)
         return self._fields_to_entry(item_id, item.get("fields") or fields)
 
 
