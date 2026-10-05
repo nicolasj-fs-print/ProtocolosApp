@@ -68,6 +68,29 @@ class Settings:
     # está set, se ignora para no contaminar la prueba).
     protocols_cc: str
 
+    # MailBot Fedrigoni (Iteración 8)
+    # Mailbox AGENTE que se loguea con --setup-auth en el server. El bot usa
+    # un token cache separado (`token_agente.cache`) para no chocar con el
+    # bot principal.
+    mailbot_inbox_user: str
+    mailbot_senders_f1: str       # listas separadas por `;`
+    mailbot_senders_f2: str
+    mailbot_processed_folder: str
+    mailbot_errors_folder: str
+    mailbot_protocol_prefix: str
+    mailbot_protocol_digits: int
+    mailbot_lf_escalate_days: int
+    # MailBot — MODO TEST LOCAL (Iteración 8 / pruebas)
+    # Si está en true:
+    #   - NO escribe el Excel "Protocolos x Ingreso OK.xlsx" en SharePoint.
+    #   - NO sube los PDFs renombrados a "Protocolos Calidad/Protocolos/".
+    #   - GUARDA los PDFs renombrados en `test_pdfs/` junto al .exe.
+    #   - MANDA un mail al destinatario configurado con los datos de la fila
+    #     que SE HUBIERA escrito al Excel.
+    # El resto del flujo (parseo, lookup LF, próximo PR, mover mails) corre normal.
+    mailbot_test_local: bool
+    mailbot_test_email: str
+
     base_dir: Path = field(default_factory=project_root)
     runtime_dir: Path = field(default_factory=runtime_dir)
 
@@ -124,6 +147,16 @@ class Settings:
             sp_tracking_list_name=os.getenv("SP_TRACKING_LIST_NAME", "Tracking Envios"),
             test_mode_override_email=os.getenv("TEST_MODE_OVERRIDE_EMAIL", ""),
             protocols_cc=os.getenv("PROTOCOLS_CC", ""),
+            mailbot_inbox_user=os.getenv("MAILBOT_INBOX_USER", ""),
+            mailbot_senders_f1=os.getenv("MAILBOT_SENDERS_F1", ""),
+            mailbot_senders_f2=os.getenv("MAILBOT_SENDERS_F2", ""),
+            mailbot_processed_folder=os.getenv("MAILBOT_PROCESSED_FOLDER", "ProtocolosProcesados"),
+            mailbot_errors_folder=os.getenv("MAILBOT_ERRORS_FOLDER", "ProtocolosErrores"),
+            mailbot_protocol_prefix=os.getenv("MAILBOT_PROTOCOL_PREFIX", "PR"),
+            mailbot_protocol_digits=int(os.getenv("MAILBOT_PROTOCOL_DIGITS", "4") or "4"),
+            mailbot_lf_escalate_days=int(os.getenv("MAILBOT_LF_ESCALATE_DAYS", "15") or "15"),
+            mailbot_test_local=_env_bool(os.getenv("MAILBOT_TEST_LOCAL"), False),
+            mailbot_test_email=os.getenv("MAILBOT_TEST_EMAIL", ""),
         )
 
     def odbc_connection_string(self, database: str | None = None) -> str:

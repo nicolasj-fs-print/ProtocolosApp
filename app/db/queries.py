@@ -100,3 +100,41 @@ def build_trazabilidad_query(n_series: int) -> str:
         f"WHERE LTRIM(RTRIM(FormularioCodgo)) IN ({codes}) "
         f"AND LEFT(LTRIM(RTRIM(Serie)), 7) IN ({placeholders})"
     )
+
+
+# Lookup por NF directamente (usado por el MailBot Fedrigoni).
+# Trae todos los matches que tengan FormularioNumero == NF y código en (LF, IRP).
+# El servicio aplicará la prioridad LF > IRP en pandas.
+SELECT_TRAZABILIDAD_BY_NF = """
+SELECT
+    LTRIM(RTRIM(FormularioCodgo)) AS FormularioCodigo,
+    LTRIM(RTRIM(CAST(FormularioNumero AS VARCHAR(50)))) AS FormularioNumero,
+    LTRIM(RTRIM(Producto)) AS Producto
+FROM dbo.TrazabilidadPapel
+WHERE LTRIM(RTRIM(FormularioCodgo)) IN ('LF', 'IRP')
+  AND LTRIM(RTRIM(CAST(FormularioNumero AS VARCHAR(50)))) = ?
+"""
+
+
+# ---------------------------------------------------------------------------
+# Búsqueda de ARTCOD por producto (MailBot Fedrigoni - Formato 2)
+# ---------------------------------------------------------------------------
+# El PDF F2 trae el "Producto" con formato variable:
+#   - "THERMAL TOP BPA FREE FSC / P7 / YG55"  (con `/`)
+#   - "TINTORETTO GESSO H+O ULTRA WS FSC SH9020 WG74"  (sin `/`)
+# La BD (STMPDH SAFED) almacena DESCRP, ADHESI y PROLIN en columnas separadas.
+# El match es fuzzy: las palabras del CONCAT(DESCRP, ADHESI, PROLIN) deben
+# aparecer en el PDF en el mismo orden (subsecuencia ordenada), permitiendo
+# palabras extras en el PDF como "FSC", "BPA FREE", etc.
+#
+# Esta query trae TODOS los registros SAFED (orden de miles, no más); el
+# matcheo fuzzy se hace en Python.
+SELECT_ALL_SAFED_PRODUCTOS = """
+SELECT
+    LTRIM(RTRIM(STMPDH_ARTCOD))                            AS ARTCOD,
+    LTRIM(RTRIM(STMPDH_DESCRP))                            AS DESCRP,
+    ISNULL(LTRIM(RTRIM(USR_STMPDH_ADHESI)), '')            AS ADHESI,
+    ISNULL(LTRIM(RTRIM(USR_STMPDH_PROLIN)), '')            AS PROLIN
+FROM dbo.STMPDH
+WHERE LTRIM(RTRIM(STMPDH_TIPPRO)) = 'SAFED'
+"""

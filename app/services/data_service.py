@@ -19,6 +19,7 @@ from ..utils.validators import (
     validate_dataframe_columns,
     validate_date_range,
 )
+from ..db import app2
 from .ingresos_service import load_ingresos
 from .trazabilidad_service import lookup_trazabilidad
 
@@ -197,33 +198,42 @@ def load_clientes_all() -> pd.DataFrame:
 
 
 def update_clientes_in_excel(updates: dict[str, str]) -> int:
-    """Aplica `updates` al Excel `Stock Mendoza.xlsm` hoja `Clientes`.
+    """DESACTIVADA (2026-09-04). Quien recibe protocolo se edita en la APP.
 
-    `updates`: {"código_cliente": "mails_separados_por_;"}.
-    Para cada código, setea Protocolos="S" y Mail Protocolos=<mails>.
+    ============================================================================
+    Por que esto ahora TIRA en vez de escribir
+    ============================================================================
+    Desde que `load_clientes_protocolos()` lee `app_2_db`, escribir la hoja `Clientes` del
+    Excel **ya no tiene ningun efecto sobre el bot**: la marca quedaria en un archivo que
+    nadie lee, y quien la puso creeria que el cliente empezo a recibir protocolos.
 
-    En backend SharePoint usa **Microsoft Graph Excel API** — edita celdas
-    directamente sin descargar/subir el archivo. ~1-3s vs ~70-90s del path
-    openpyxl. Preserva macros automáticamente (la API solo toca las celdas
-    pedidas).
+    Ese es exactamente el modo de falla que la mudanza vino a cerrar, pero al reves — y es
+    peor que el anterior, porque falla en SILENCIO y del lado del que agrega un cliente.
 
-    En backend local cae al método clásico con openpyxl.
-    Devuelve el N de filas modificadas.
+    El alta, la edicion de destinatarios y la baja viven ahora en
+    `/despacho/protocolos` -> boton "Clientes con protocolo".
+
+    ⚠️ NO se "arregla" haciendo que escriba en las dos partes. Dos escritores sobre el mismo
+    dato es de donde venimos: la app y el Excel ya habian divergido en 3 de 13 clientes.
     """
-    if not updates:
-        return 0
+    raise RuntimeError(
+        "Los clientes con protocolo ya no se editan desde esta aplicacion.\n\n"
+        "Desde el 2026-09-04 el bot lee la lista de app_2_db, asi que marcar un cliente en "
+        "el Excel no hace nada: el mail nunca le llegaria.\n\n"
+        "Entra a Seguimiento de Ordenes -> Despacho -> Protocolos de calidad y usa el boton "
+        '"Clientes con protocolo" (pestanas "Reciben protocolo" y "Anadir clientes").\n\n'
+        f"({len(updates)} cliente(s) NO se guardaron.)"
+    )
 
-    s = get_settings()
-    log.info("update_clientes_in_excel: %d cliente(s) a actualizar", len(updates))
 
-    if s.storage_backend == "sharepoint":
-        modified = _update_clientes_via_graph_api(updates)
-    else:
-        modified = _update_clientes_via_openpyxl(updates)
-
-    # Invalidar cache para que el próximo load_clientes_all baje la versión actualizada.
-    _invalidate_clients_cache()
-    return modified
+# ---------------------------------------------------------------------------
+# ⚠️ Los dos helpers de abajo YA NO LOS LLAMA NADIE desde que
+# `update_clientes_in_excel()` tira. Se dejan a proposito: son la unica
+# documentacion ejecutable de como se escribia la hoja `Clientes` (el mapeo de
+# headers, el manejo del 423 "resourceLocked" cuando alguien tiene el .xlsm
+# abierto), y si alguna vez hay que volver atras, volver es borrar el `raise`.
+# No agregarles llamadores nuevos: la fuente de verdad es `app_2_db`.
+# ---------------------------------------------------------------------------
 
 
 def _update_clientes_via_graph_api(updates: dict[str, str]) -> int:
@@ -366,8 +376,82 @@ def _update_clientes_via_openpyxl(updates: dict[str, str]) -> int:
     return modified
 
 
+#: De dónde salió la última lista de clientes: "app_2_db" o "excel-fallback".
+#: Lo lee el runner para poder gritarlo en el resumen de la corrida.
+ULTIMA_FUENTE_CLIENTES = "(sin leer)"
+
+
+def _clientes_desde_app2() -> pd.DataFrame:
+    """La lista de app_2_db, con la MISMA forma que devolvia el Excel.
+
+    Se rearman las 5 columnas de `_CLIENT_COLUMNS_EXCEL` aunque la vista traiga 3: el resto
+    del pipeline (build_dataframe, los dialogos de la GUI) espera ese shape, y cambiarlo
+    seria tocar cinco lugares para no ganar nada. `Region` va vacia porque el bot no la usa
+    y la vista no la expone a proposito.
+    """
+    filas = app2.leer_clientes_protocolo()
+    df = pd.DataFrame(
+        {
+            "Codigo de cliente": [f["codigo"] for f in filas],
+            "Region": ["" for _ in filas],
+            "Protocolos": ["S" for _ in filas],
+            "Razon Social": [f["nombre"] for f in filas],
+            "Mail Protocolos": [f["mails"] for f in filas],
+        }
+    )
+    # La columna del Excel lleva tilde en "Codigo"; se respeta el nombre exacto.
+    df = df.rename(columns={"Codigo de cliente": _CLIENT_COLUMNS_EXCEL[0]})
+    # ⚠️ `astype(str)` porque el camino del Excel leia con `dtype=str` y TODO el pipeline de
+    # abajo hace `.str.strip()` sobre estas columnas. Con un DataFrame vacio, pandas les
+    # pondria float64 y el primer `.str` reventaria con un AttributeError — justo el dia que
+    # no haya ningun cliente marcado, que es el caso raro que nadie prueba.
+    return df[_CLIENT_COLUMNS_EXCEL].astype(str).reset_index(drop=True)
+
+
 def load_clientes_protocolos() -> pd.DataFrame:
+    """Los clientes que reciben protocolo y sus destinatarios.
+
+    ============================================================================
+    FUENTE: `app_2_db`, NO el Excel  (2026-09-04)
+    ============================================================================
+    Hasta esta fecha salia de la hoja `Clientes` de `Stock Mendoza.xlsm`. Ese dato ya vivia
+    ADEMAS en `clientes.protocolos` / `clientes.mail_protocolos` de la app de Seguimiento de
+    Ordenes, sin que nadie lo leyera, asi que estaba en dos lados y habia divergido: 13
+    marcados en el Excel contra 11 en la base, dos clientes sin marcar y a uno le faltaba un
+    destinatario. Ahora se edita en UN solo lugar —`/despacho/protocolos` de la app— y esto
+    es lo que hace que el bot vea esas ediciones.
+
+    ⚠️ SI LA BASE NO RESPONDE SE CAE AL EXCEL, y se grita. La alternativa —abortar la
+    corrida— dejaria sin protocolo a los 13 clientes por un problema de red, cuando 12 de
+    ellos no cambiaron. El Excel queda como red de emergencia: puede estar desactualizado,
+    y por eso el WARNING sale con todas las letras y `ULTIMA_FUENTE_CLIENTES` queda en
+    "excel-fallback" para que el resumen de la corrida lo diga.
+
+    ⚠️ Lo que NO hay que hacer es al reves —leer el Excel y caer a la base—: seria volver a
+    tener dos fuentes vivas, que es de donde venimos.
+    """
+    global ULTIMA_FUENTE_CLIENTES
     s = get_settings()
+
+    if app2.esta_configurado():
+        try:
+            df = _clientes_desde_app2()
+            ULTIMA_FUENTE_CLIENTES = "app_2_db"
+            log.info("Clientes con protocolo (app_2_db): %d", len(df))
+            return df
+        except Exception as e:
+            log.error(
+                "!! No se pudo leer los clientes de app_2_db (%s). Se usa el Excel como "
+                "RESPALDO: puede estar desactualizado y no incluir altas hechas desde la app.",
+                e,
+            )
+    else:
+        log.warning(
+            "app_2_db no esta configurada (APP2_PG_*): se lee el Excel. Es el modo viejo; "
+            "las altas hechas desde /despacho/protocolos NO se van a ver."
+        )
+
+    ULTIMA_FUENTE_CLIENTES = "excel-fallback"
 
     if s.storage_backend == "sharepoint":
         raw = _sp_get_or_download(s.sp_clients_file)

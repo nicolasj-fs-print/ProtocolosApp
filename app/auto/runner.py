@@ -72,8 +72,26 @@ def _read_pdf_local(result: ComprobanteResult) -> bytes | None:
     return None
 
 
-def _subject_cliente(razon_social: str, comprobante: str) -> str:
-    return f"Protocolos de calidad - {razon_social} | Remito {comprobante}"
+def _subject_cliente(razon_social: str, comprobante: str, numero_oc: str = "") -> str:
+    """El asunto del mail al cliente.
+
+        Protocolos de calidad - {razon_social} | Remito {comprobante} - OC: {oc}
+
+    AVISO: tiene que decir lo MISMO que `asuntoProtocolos()` de
+    `src/lib/protocolos/mail.ts` en el repo app-2 (Seguimiento de Ordenes). Los dos mails
+    salen del mismo circuito y le llegan al MISMO cliente: este bot manda los automaticos y
+    la app arma el borrador de los que quedan en pending_control. Con dos asuntos distintos
+    el mismo remito se ve como dos cosas en su bandeja. Si se toca uno, se toca el otro en la
+    misma tanda.
+
+    AVISO: el tramo de la OC se OMITE cuando no hay, en vez de escribir SIN_OC como hace
+    `_output_filename()`. Medido sobre los RX0018 de 365 dias (2026-10-05): 2.633 de 2.748
+    traen OC y 115 no. Un asunto que termina en "- OC:" con nada atras se lee como un mail
+    roto, y SIN_OC es una convencion de nombre de archivo que al cliente no le dice nada.
+    """
+    base = f"Protocolos de calidad - {razon_social} | Remito {comprobante}"
+    oc = (numero_oc or "").strip()
+    return f"{base} - OC: {oc}" if oc else base
 
 
 def _subject_control(comprobante: str) -> str:
@@ -259,7 +277,8 @@ def _process_comprobante(
         }
 
     pdf_name = _pdf_filename(result)
-    subject = _subject_cliente(razon_social, comp)
+    # La misma OC que va en la caratula del PDF y en el nombre del archivo (pdf_service).
+    subject = _subject_cliente(razon_social, comp, result.numero_oc)
     html = build_html_body(
         razon_social, comp,
         result.protocolos_encontrados,
